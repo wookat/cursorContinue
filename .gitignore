@@ -8,7 +8,7 @@ __pycache__/
 .vscode/
 .cursor/
 .claude/
-*.vsix
+# *.vsix - 保留发布的插件包
 *.log
 *.exe
 *.dll
