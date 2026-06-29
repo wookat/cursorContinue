@@ -1,0 +1,114 @@
+{
+  "name": "local-continue-assistant",
+  "displayName": "续聊助手",
+  "description": "Cursor 续聊助手：队列、握手、状态反馈、附件输入、图片粘贴和官方聊天框重试助手。",
+  "version": "0.7.0",
+  "publisher": "local-codex",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:localContinue.panel",
+    "onCommand:localContinue.open"
+  ],
+  "main": "./extension.js",
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "local-continue-bottom-panel",
+          "title": "续聊助手",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "local-continue-bottom-panel": [
+        {
+          "type": "webview",
+          "id": "localContinue.panel",
+          "name": "续聊助手",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "localContinue.open",
+        "title": "续聊助手：打开面板"
+      },
+      {
+        "command": "localContinue.installRule",
+        "title": "续聊助手：给当前项目安装规则"
+      },
+      {
+        "command": "localContinue.copyAgentInstruction",
+        "title": "续聊助手：复制规则指令"
+      },
+      {
+        "command": "localContinue.startWait",
+        "title": "续聊助手：启动等待终端"
+      },
+      {
+        "command": "localContinue.runDoctor",
+        "title": "续聊助手：运行 doctor 自检"
+      },
+      {
+        "command": "localContinue.sendInstruction",
+        "title": "续聊助手：发送指令"
+      },
+      {
+        "command": "localContinue.stop",
+        "title": "续聊助手：停止循环"
+      },
+      {
+        "command": "localContinue.installRetryPatch",
+        "title": "续聊助手：安装官方聊天框重试助手"
+      },
+      {
+        "command": "localContinue.uninstallRetryPatch",
+        "title": "续聊助手：卸载官方聊天框重试助手"
+      },
+      {
+        "command": "localContinue.workspaceSummary",
+        "title": "续聊助手：生成工作区摘要"
+      },
+      {
+        "command": "localContinue.startBridge",
+        "title": "续聊助手：启动 HTTP Bridge"
+      },
+      {
+        "command": "localContinue.stopBridge",
+        "title": "续聊助手：停止 HTTP Bridge"
+      }
+    ]
+  },
+  "scripts": {
+    "package": "vsce package --no-dependencies --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.2"
+  },
+  "files": [
+    "extension.js",
+    "package.json",
+    "README.md",
+    "LICENSE.txt",
+    "media/icon.svg",
+    "media/panel.css",
+    "media/panel.js",
+    "media/official-retry-helper.js",
+    "runtime/instruction.py",
+    "runtime/instruction.js",
+    "runtime/cutc_rules_template.mdc"
+  ]
+}

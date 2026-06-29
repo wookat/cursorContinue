@@ -1,0 +1,29 @@
+---
+description: CUTC Continue bridge loop
+globs:
+alwaysApply: false
+---
+# CUTC Continue 指令桥接循环
+
+## 工作流程
+
+1. 正常完成当前任务。
+
+2. 每轮任务结束后，在项目终端中运行以下命令并等待下一条指令：
+
+```powershell
+{{PYTHON_COMMAND}} "{{INSTRUCTION_PATH}}" --state-dir "{{STATE_DIR}}"
+```
+
+3. `instruction.py` 启动后会写入 `{{STATE_DIR}}\status.json` 并持续刷新 heartbeat。CUTC 面板看到 `state=waiting` 且 heartbeat 在 5 秒内，会显示“已连接”。
+
+4. 读取脚本输出：
+
+- 普通文本就是下一条用户指令。
+- `FILE_CONTEXT_START:name::content:FILE_CONTEXT_END` 表示把 `content` 当作文件上下文。
+- `IMAGE_CONTEXT_START:name::base64:IMAGE_CONTEXT_END` 表示把图片数据当作视觉上下文。
+- `stop` 表示结束循环。
+
+5. 执行收到的指令，然后继续回到第 2 步，直到收到 `stop`。
+
+重要：`instruction.py` 通过 `{{STATE_DIR}}\queue.json` 接收 CUTC 面板发来的消息。不要使用 `input()`，也不要要求用户在等待终端里输入。

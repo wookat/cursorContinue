@@ -1,0 +1,17 @@
+{
+  "protocol": 3,
+  "session_id": "ad8f567a7ec5409f9adc109a2d790925",
+  "state": "received",
+  "pid": 31700,
+  "heartbeat_ms": 1781546798032,
+  "heartbeat_at": "2026-06-16T02:06:38+0800",
+  "queue_length": 0,
+  "queue_path": "D:\\Users\\yotal\\Documents\\Research\\cursorContinue\\cutc-continue\\.tmp-installed-state\\queue.json",
+  "status_path": "D:\\Users\\yotal\\Documents\\Research\\cursorContinue\\cutc-continue\\.tmp-installed-state\\status.json",
+  "started_at": "2026-06-16T02:06:37+0800",
+  "last_ack_id": "88f329d0671341cb9295d4e5395f46c1",
+  "last_ack_at": "2026-06-16T02:06:38+0800",
+  "last_message_preview": "installed runtime ok",
+  "remaining_queue_length": 0,
+  "uptime_ms": 24
+}

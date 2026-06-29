@@ -1,0 +1,89 @@
+{
+  "name": "cutc-continue",
+  "displayName": "持续对话助手",
+  "description": "Cursor 本地持续对话助手：队列、握手、状态反馈和可选官方聊天框重试助手。",
+  "version": "0.4.1",
+  "publisher": "local-codex",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:cutcContinue.panel",
+    "onCommand:cutcContinue.open"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "cutc-continue-bottom-panel",
+          "title": "持续对话助手",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "cutc-continue-bottom-panel": [
+        {
+          "type": "webview",
+          "id": "cutcContinue.panel",
+          "name": "持续对话助手",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "cutcContinue.open",
+        "title": "持续对话助手：打开面板"
+      },
+      {
+        "command": "cutcContinue.installRule",
+        "title": "持续对话助手：给当前项目安装规则"
+      },
+      {
+        "command": "cutcContinue.startWait",
+        "title": "持续对话助手：启动等待终端"
+      },
+      {
+        "command": "cutcContinue.sendInstruction",
+        "title": "持续对话助手：发送指令"
+      },
+      {
+        "command": "cutcContinue.stop",
+        "title": "持续对话助手：停止循环"
+      },
+      {
+        "command": "cutcContinue.installRetryPatch",
+        "title": "持续对话助手：安装官方聊天框重试助手"
+      },
+      {
+        "command": "cutcContinue.uninstallRetryPatch",
+        "title": "持续对话助手：卸载官方聊天框重试助手"
+      }
+    ]
+  },
+  "scripts": {
+    "package": "vsce package --no-dependencies --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.2"
+  },
+  "files": [
+    "extension.js",
+    "package.json",
+    "README.md",
+    "LICENSE.txt",
+    "media/icon.svg",
+    "media/panel.css",
+    "media/official-retry-helper.js",
+    "runtime/instruction.py",
+    "runtime/cutc_rules_template.mdc"
+  ]
+}

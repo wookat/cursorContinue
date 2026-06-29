@@ -1,0 +1,17 @@
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+.idea/
+.vscode/
+.cursor/
+.claude/
+*.vsix
+*.log
+*.exe
+*.dll
+*.node
+cursorContinue (1)/
+cursor-continue-a8-ttvet-cn-relay-0.6.0-extracted/

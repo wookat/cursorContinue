@@ -1,0 +1,17 @@
+{
+  "protocol": 3,
+  "session_id": "2a37c2c557e64e05ba0533a18f6ffdbf",
+  "state": "received",
+  "pid": 24448,
+  "heartbeat_ms": 1781546612431,
+  "heartbeat_at": "2026-06-16T02:03:32+0800",
+  "queue_length": 0,
+  "queue_path": "D:\\Users\\yotal\\Documents\\Research\\cursorContinue\\cutc-continue\\.tmp-state3\\queue.json",
+  "status_path": "D:\\Users\\yotal\\Documents\\Research\\cursorContinue\\cutc-continue\\.tmp-state3\\status.json",
+  "started_at": "2026-06-16T02:03:30+0800",
+  "last_ack_id": "27a71a58b3e14b1e915dc494495f2dbb",
+  "uptime_ms": 2057,
+  "last_ack_at": "2026-06-16T02:03:32+0800",
+  "last_message_preview": "\u63e1\u624b\u540e\u6d88\u606f",
+  "remaining_queue_length": 0
+}

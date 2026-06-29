@@ -1,0 +1,1261 @@
+#!/usr/bin/env node
+"use strict";
+
+// Node port of instruction.py -- the multi-session bridge runtime.
+//
+// Why Node: the agent's terminal always has a Node binary reachable (locally the
+// Cursor/Electron binary via ELECTRON_RUN_AS_NODE=1, on a Remote-SSH host the
+// Cursor server's bundled node), whereas Python is not guaranteed and, on
+// Windows, pays a heavy per-spawn antivirus cost. This runtime is byte-for-byte
+// compatible with the Python one at the level that matters: the rendered stdout,
+// the KEEPALIVE_NOOP sentinel, exit codes, and the on-disk state/queue/lock
+// layout, so the panel (extension.js) and the agent loop behave identically
+// regardless of which runtime is used. Runs the same on Windows and Linux.
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const crypto = require("crypto");
+const http = require("http");
+const { spawnSync } = require("child_process");
+
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"]);
+const TEXT_EXTENSIONS = new Set([
+  ".txt", ".py", ".js", ".ts", ".tsx", ".jsx", ".md", ".html", ".css",
+  ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".ps1", ".sh", ".bat",
+  ".c", ".cpp", ".h", ".hpp", ".cs", ".java", ".go", ".rs", ".php", ".rb",
+]);
+
+const LOCK_STALE_MS = 15000;
+const LOCK_WAIT_SECONDS = 5;
+const DEFAULT_SETTINGS = {
+  waitTimeoutSeconds: 0,
+  keepaliveSeconds: 300,
+  offlineAfterSeconds: 15,
+  maxConcurrentSessions: 4,
+  schedulingMode: "direct",
+  perSessionQueueLimit: 3,
+  globalQueueLimit: 20,
+  pollSeconds: 0.2,
+  historyLimit: 200,
+  imageLimit: 50,
+  imageMaxDimension: 2000,
+  notifyOnAttention: true,
+};
+
+// Windows holds files open briefly (other waiter, panel reader, AV, indexer),
+// making an atomic rename/read fail transiently. Retry with jittered backoff
+// instead of crashing -- this is what keeps multi-session stable.
+const RENAME_RETRY_ATTEMPTS = 24;
+const RENAME_RETRY_BASE_DELAY = 15;
+const RENAME_RETRY_MAX_DELAY = 300;
+const BEST_EFFORT_ATTEMPTS = 6;
+const READ_RETRY_ATTEMPTS = 6;
+const TRANSIENT_FS_CODES = new Set(["EPERM", "EACCES", "EBUSY", "EEXIST", "ENFILE", "EMFILE"]);
+
+const PY_SLOW_SPAWN_MS = 3000;
+
+function isTransientFsError(error) {
+  return Boolean(error) && TRANSIENT_FS_CODES.has(error.code);
+}
+
+// Synchronous sleep for the retry backoff (no event loop work to do mid-retry).
+// Atomics.wait on a private buffer blocks the thread for the full timeout, so no
+// busy-wait is needed.
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, Math.round(ms)));
+}
+
+function retryTransient(action, attempts = RENAME_RETRY_ATTEMPTS, baseDelay = RENAME_RETRY_BASE_DELAY, maxDelay = RENAME_RETRY_MAX_DELAY) {
+  let delay = baseDelay;
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return action();
+    } catch (error) {
+      if (!isTransientFsError(error)) throw error;
+      lastError = error;
+      if (attempt === attempts - 1) break;
+      sleepSync(Math.min(delay, maxDelay) * (0.5 + Math.random()));
+      delay = Math.min(delay * 1.7, maxDelay);
+    }
+  }
+  if (lastError) throw lastError;
+  return undefined;
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function isoNow() {
+  return new Date().toISOString();
+}
+
+function safeSessionId(value) {
+  const raw = String(value == null ? "" : value).trim().toLowerCase();
+  const cleaned = raw.replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+  return cleaned || "agent-1";
+}
+
+function normalizePayload(item) {
+  if (typeof item === "string") {
+    return {
+      status: "continue",
+      user_input: item,
+      selected_choice: null,
+      file_paths: [],
+      image_paths: [],
+      suggested_tools: [],
+    };
+  }
+  if (!item || typeof item !== "object") return normalizePayload("");
+  const payload = item.payload && typeof item.payload === "object" ? item.payload : item;
+  return {
+    status: payload.status || "continue",
+    user_input: String(payload.user_input || item.message || ""),
+    selected_choice: payload.selected_choice != null ? payload.selected_choice : null,
+    file_paths: (payload.file_paths || []).filter(Boolean).map(String),
+    image_paths: (payload.image_paths || []).filter(Boolean).map(String),
+    suggested_tools: (payload.suggested_tools || []).filter(Boolean).map(String),
+  };
+}
+
+function normalizeQueue(data) {
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.messages)) return data.messages;
+  if (data && typeof data === "object" && (data.payload || data.message || data.id)) return [data];
+  return [];
+}
+
+function makeQueueItem(payloadInput, source, target) {
+  const payload = normalizePayload(payloadInput);
+  return {
+    id: crypto.randomUUID().replace(/-/g, ""),
+    payload,
+    message: payload.user_input,
+    source,
+    target,
+    created_at: isoNow(),
+    created_at_ms: nowMs(),
+    pid: process.pid,
+  };
+}
+
+class ProjectState {
+  constructor(stateDir) {
+    this.stateDir = path.resolve(stateDir);
+    this.sessionsDir = path.join(this.stateDir, "sessions");
+    this.sessionsPath = path.join(this.stateDir, "sessions.json");
+    this.settingsPath = path.join(this.stateDir, "settings.json");
+    this.globalQueuePath = path.join(this.stateDir, "global_queue.json");
+    this.globalQueueLock = path.join(this.stateDir, ".global_queue.lock");
+    this.historyPath = path.join(this.stateDir, "history.jsonl");
+  }
+
+  ensure() {
+    fs.mkdirSync(this.stateDir, { recursive: true });
+    fs.mkdirSync(this.sessionsDir, { recursive: true });
+  }
+
+  readJson(filePath, fallback) {
+    for (let attempt = 0; attempt < READ_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        const raw = fs.readFileSync(filePath, "utf8");
+        return JSON.parse(raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw);
+      } catch (error) {
+        if (error && (error.code === "ENOENT" || error instanceof SyntaxError)) return fallback;
+        if (!isTransientFsError(error) || attempt === READ_RETRY_ATTEMPTS - 1) return fallback;
+        sleepSync(20 * (attempt + 1));
+      }
+    }
+    return fallback;
+  }
+
+  _tmpSuffix = null;
+  writeJsonAtomic(filePath, data, attempts = RENAME_RETRY_ATTEMPTS) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    if (!this._tmpSuffix) this._tmpSuffix = `${process.pid}.${crypto.randomUUID().replace(/-/g, "")}`;
+    const tmp = `${filePath}.${this._tmpSuffix}.tmp`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(data), "utf8");
+      retryTransient(() => fs.renameSync(tmp, filePath), attempts);
+    } finally {
+      try { if (fs.existsSync(tmp)) fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    }
+  }
+
+  writeJsonBestEffort(filePath, data) {
+    try {
+      this.writeJsonAtomic(filePath, data, BEST_EFFORT_ATTEMPTS);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  _settingsSig = null;
+  _settingsCache = null;
+  settings() {
+    let sig;
+    try {
+      const stat = fs.statSync(this.settingsPath);
+      sig = `${stat.mtimeMs}:${stat.size}`;
+    } catch {
+      return { ...DEFAULT_SETTINGS };
+    }
+    if (this._settingsSig === sig && this._settingsCache) return this._settingsCache;
+    const data = this.readJson(this.settingsPath, {});
+    this._settingsCache = { ...DEFAULT_SETTINGS, ...(data && typeof data === "object" ? data : {}) };
+    this._settingsSig = sig;
+    return this._settingsCache;
+  }
+
+  acquireLock(lockDir, timeoutSeconds = LOCK_WAIT_SECONDS, staleMs = LOCK_STALE_MS) {
+    this.ensure();
+    const started = Date.now();
+    const token = `${process.pid}.${crypto.randomUUID().replace(/-/g, "")}`;
+    for (;;) {
+      try {
+        fs.mkdirSync(lockDir, { recursive: false });
+        // Stamp ownership so releaseLock only deletes a lock we still hold: after
+        // a stale-takeover the original owner must not delete the successor's lock.
+        try { fs.writeFileSync(path.join(lockDir, "owner"), token, "utf8"); } catch { /* best effort */ }
+        return token;
+      } catch (error) {
+        if (error && error.code !== "EEXIST") throw error;
+        try {
+          const ageMs = nowMs() - fs.statSync(lockDir).mtimeMs;
+          if (ageMs > staleMs) {
+            fs.rmSync(lockDir, { recursive: true, force: true });
+            continue;
+          }
+        } catch (statError) {
+          if (statError && statError.code === "ENOENT") continue;
+        }
+        if ((Date.now() - started) / 1000 > timeoutSeconds) throw new Error(`lock timeout: ${lockDir}`);
+        sleepSync(40);
+      }
+    }
+  }
+
+  releaseLock(lockDir, token) {
+    // With a token, only remove the lock if we still own it (don't delete a
+    // successor's lock after a stale-takeover). Without one, keep old behavior.
+    if (token) {
+      let current = null;
+      try { current = fs.readFileSync(path.join(lockDir, "owner"), "utf8"); } catch { /* missing */ }
+      if (current !== null && current !== token) return;
+    }
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  }
+
+  _historyLimit = null;
+  appendHistory(record, limit) {
+    this.ensure();
+    const line = `${JSON.stringify(record)}\n`;
+    try {
+      retryTransient(() => fs.appendFileSync(this.historyPath, line, "utf8"), BEST_EFFORT_ATTEMPTS);
+    } catch {
+      return;
+    }
+    if (this._historyLimit === null) this._historyLimit = Number(this.settings().historyLimit || 200);
+    this.trimJsonl(this.historyPath, limit || this._historyLimit);
+  }
+
+  trimJsonl(filePath, limit) {
+    if (!limit || limit <= 0) return;
+    try {
+      // Skip the full read+parse when the file is clearly under the limit (~512
+      // bytes per line heuristic). Avoids reading the whole file on every append.
+      const stat = fs.statSync(filePath);
+      if (stat.size < limit * 512) return;
+      const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/).filter(Boolean);
+      if (lines.length <= limit) return;
+      // Atomic rewrite (tmp + rename) so a concurrent append from another process
+      // can't be clobbered by a partial trim write.
+      const tmp = `${filePath}.${this._tmpSuffix || (this._tmpSuffix = `${process.pid}.${crypto.randomUUID().replace(/-/g, "")}`)}.tmp`;
+      try {
+        fs.writeFileSync(tmp, `${lines.slice(-limit).join("\n")}\n`, "utf8");
+        retryTransient(() => fs.renameSync(tmp, filePath), BEST_EFFORT_ATTEMPTS);
+      } finally {
+        try { if (fs.existsSync(tmp)) fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+      }
+    } catch {
+      /* best effort */
+    }
+  }
+
+  sessionsIndex() {
+    const data = this.readJson(this.sessionsPath, { sessions: [], roundRobinIndex: 0 });
+    const index = data && typeof data === "object" ? data : { sessions: [], roundRobinIndex: 0 };
+    if (!Array.isArray(index.sessions)) index.sessions = [];
+    if (!Number.isInteger(index.roundRobinIndex)) index.roundRobinIndex = 0;
+    return index;
+  }
+
+  saveSessionsIndex(index) {
+    this.writeJsonAtomic(this.sessionsPath, index);
+  }
+
+  registerSession(sessionId, name) {
+    this.ensure();
+    const id = safeSessionId(sessionId);
+    const index = this.sessionsIndex();
+    const existing = index.sessions.find((item) => item.id === id);
+    if (existing) {
+      if (name && existing.name !== name) {
+        existing.name = name;
+        this.saveSessionsIndex(index);
+      }
+      return existing;
+    }
+    const item = { id, name: name || id, created_at: isoNow(), created_at_ms: nowMs() };
+    index.sessions.push(item);
+    this.saveSessionsIndex(index);
+    new SessionState(this, id).ensure();
+    return item;
+  }
+
+  session(sessionId) {
+    const id = safeSessionId(sessionId);
+    this.registerSession(id);
+    return new SessionState(this, id);
+  }
+
+  readGlobalQueue() {
+    return normalizeQueue(this.readJson(this.globalQueuePath, []));
+  }
+
+  enqueueGlobal(payload, source = "manual") {
+    const lockToken = this.acquireLock(this.globalQueueLock);
+    let item;
+    try {
+      const queue = this.readGlobalQueue();
+      const limit = Number(this.settings().globalQueueLimit || 20) || 20;
+      if (queue.length >= limit) throw new Error(`空闲优先队列已达到上限 ${limit}。`);
+      item = makeQueueItem(payload, source, "idle-first");
+      queue.push(item);
+      this.writeJsonAtomic(this.globalQueuePath, queue);
+    } finally {
+      this.releaseLock(this.globalQueueLock, lockToken);
+    }
+    this.appendHistory({ type: "queued_global", ...item });
+    return item;
+  }
+
+  popGlobal() {
+    if (!this.readGlobalQueue().length) return [null, 0, true];
+    let lockToken = null;
+    try {
+      lockToken = this.acquireLock(this.globalQueueLock);
+      const queue = this.readGlobalQueue();
+      if (!queue.length) return [null, 0, true];
+      const item = queue.shift();
+      this.writeJsonAtomic(this.globalQueuePath, queue);
+      return [item, queue.length, true];
+    } catch {
+      // Lock busy or write failed -> inconclusive. Signal the caller to retry
+      // without advancing the queue signature, so the item is not skipped.
+      return [null, 0, false];
+    } finally {
+      if (lockToken) this.releaseLock(this.globalQueueLock, lockToken);
+    }
+  }
+
+  clearGlobal() {
+    const lockToken = this.acquireLock(this.globalQueueLock);
+    try {
+      this.writeJsonAtomic(this.globalQueuePath, []);
+    } finally {
+      this.releaseLock(this.globalQueueLock, lockToken);
+    }
+    this.appendHistory({ type: "global_queue_cleared", at: isoNow() });
+  }
+
+  statusSummary() {
+    const settings = this.settings();
+    const offlineAfterMs = Number(settings.offlineAfterSeconds || 15) * 1000;
+    const sessions = this.sessionsIndex().sessions.map((item) => new SessionState(this, item.id).summary(item, offlineAfterMs));
+    return {
+      settings,
+      sessions,
+      global_queue_length: this.readGlobalQueue().length,
+    };
+  }
+}
+
+class SessionState {
+  constructor(project, sessionId) {
+    this.project = project;
+    this.sessionId = safeSessionId(sessionId);
+    this.dir = path.join(project.sessionsDir, this.sessionId);
+    this.queuePath = path.join(this.dir, "queue.json");
+    this.statusPath = path.join(this.dir, "status.json");
+    this.historyPath = path.join(this.dir, "history.jsonl");
+    this.queueLockDir = path.join(this.dir, ".queue.lock");
+    this.waiterLockDir = path.join(this.dir, "waiter.lock");
+  }
+
+  ensure() {
+    fs.mkdirSync(this.dir, { recursive: true });
+  }
+
+  readJson(filePath, fallback) {
+    return this.project.readJson(filePath, fallback);
+  }
+
+  writeJsonBestEffort(filePath, data) {
+    return this.project.writeJsonBestEffort(filePath, data);
+  }
+
+  queue() {
+    return normalizeQueue(this.readJson(this.queuePath, []));
+  }
+
+  // Cached queue length keyed by stat signature, so writeStatus's heartbeat
+  // path doesn't re-read+parse the queue file when it hasn't changed.
+  _queueLenSig = null;
+  _queueLenCache = 0;
+  queueLengthCached() {
+    let sig;
+    try {
+      const stat = fs.statSync(this.queuePath);
+      sig = `${stat.mtimeMs}:${stat.size}`;
+    } catch {
+      return 0;
+    }
+    if (this._queueLenSig === sig) return this._queueLenCache;
+    const len = this.queue().length;
+    this._queueLenSig = sig;
+    this._queueLenCache = len;
+    return len;
+  }
+
+  _historyLimit = null;
+  appendHistory(record) {
+    this.ensure();
+    const line = `${JSON.stringify(record)}\n`;
+    try {
+      retryTransient(() => fs.appendFileSync(this.historyPath, line, "utf8"), BEST_EFFORT_ATTEMPTS);
+    } catch {
+      return;
+    }
+    if (this._historyLimit === null) this._historyLimit = Number(this.project.settings().historyLimit || 200);
+    this.project.trimJsonl(this.historyPath, this._historyLimit);
+  }
+
+  enqueue(payload, source = "manual") {
+    const lockToken = this.project.acquireLock(this.queueLockDir);
+    let item;
+    try {
+      const queue = this.queue();
+      const limit = Number(this.project.settings().perSessionQueueLimit || 3) || 3;
+      if (queue.length >= limit) throw new Error(`${this.sessionId} 的队列已达到上限 ${limit}。`);
+      item = makeQueueItem(payload, source, this.sessionId);
+      queue.push(item);
+      this.project.writeJsonAtomic(this.queuePath, queue);
+    } finally {
+      this.project.releaseLock(this.queueLockDir, lockToken);
+    }
+    this.appendHistory({ type: "queued", ...item });
+    this.project.appendHistory({ type: "queued_session", session_id: this.sessionId, ...item });
+    return item;
+  }
+
+  popNext() {
+    if (!this.queue().length) return [null, 0, true];
+    let lockToken = null;
+    try {
+      lockToken = this.project.acquireLock(this.queueLockDir);
+      const queue = this.queue();
+      if (!queue.length) return [null, 0, true];
+      const item = queue.shift();
+      this.project.writeJsonAtomic(this.queuePath, queue);
+      return [item, queue.length, true];
+    } catch {
+      // Lock busy or write failed -> inconclusive. Signal the caller to retry
+      // without advancing the queue signature, so the item is not skipped.
+      return [null, 0, false];
+    } finally {
+      if (lockToken) this.project.releaseLock(this.queueLockDir, lockToken);
+    }
+  }
+
+  _waiterCache = null;
+  currentWaiter() {
+    if (this._waiterCache) return this._waiterCache;
+    const owner = this.readJson(path.join(this.waiterLockDir, "owner.json"), null);
+    this._waiterCache = owner;
+    return owner;
+  }
+
+  writeWaiterOwner(runId) {
+    const owner = {
+      pid: process.pid,
+      session_id: this.sessionId,
+      run_id: runId,
+      heartbeat_ms: nowMs(),
+      heartbeat_at: isoNow(),
+    };
+    const ok = this.writeJsonBestEffort(path.join(this.waiterLockDir, "owner.json"), owner);
+    if (ok) this._waiterCache = owner;
+    return [ok, owner];
+  }
+
+  acquireWaiter(runId) {
+    this.ensure();
+    for (;;) {
+      try {
+        fs.mkdirSync(this.waiterLockDir, { recursive: false });
+      } catch (error) {
+        if (error && error.code !== "EEXIST") throw error;
+        const owner = this.currentWaiter() || {};
+        const heartbeatMs = Number(owner.heartbeat_ms || 0);
+        const ageMs = heartbeatMs ? nowMs() - heartbeatMs : LOCK_STALE_MS + 1;
+        if (ageMs > LOCK_STALE_MS) {
+          fs.rmSync(this.waiterLockDir, { recursive: true, force: true });
+          continue;
+        }
+        return [false, owner];
+      }
+      // We hold the lock dir; persist ownership or back out. A missing owner.json
+      // would otherwise be misread as a stale lock by a rival waiter (heartbeat
+      // absent -> treated as expired), allowing two waiters for one session.
+      const [ok, owner] = this.writeWaiterOwner(runId);
+      if (!ok) {
+        fs.rmSync(this.waiterLockDir, { recursive: true, force: true });
+        return [false, owner];
+      }
+      return [true, owner];
+    }
+  }
+
+  refreshWaiter(runId) {
+    const owner = this.currentWaiter() || {};
+    if (owner.run_id === runId) this.writeWaiterOwner(runId);
+  }
+
+  releaseWaiter(runId) {
+    const owner = this.currentWaiter() || {};
+    if (owner.run_id === runId) fs.rmSync(this.waiterLockDir, { recursive: true, force: true });
+    this._waiterCache = null;
+  }
+
+  _lastStatus = null;
+  writeStatus(runId, state, extra = {}) {
+    // Reuse the last-written status as the base instead of re-reading
+    // status.json every heartbeat. Only one waiter owns the session, so
+    // there's no concurrent writer to invalidate our cache.
+    const status = this._lastStatus ? { ...this._lastStatus } : this.readJson(this.statusPath, {});
+    Object.assign(status, {
+      protocol: 6,
+      session_id: this.sessionId,
+      run_id: runId,
+      state,
+      pid: process.pid,
+      heartbeat_ms: nowMs(),
+      heartbeat_at: isoNow(),
+      queue_length: this.queueLengthCached(),
+      queue_path: this.queuePath,
+      status_path: this.statusPath,
+      waiter: this.currentWaiter(),
+    }, extra);
+    this.writeJsonBestEffort(this.statusPath, status);
+    this._lastStatus = status;
+  }
+
+  recordResult(summary, resultStatus = "done", runId = null) {
+    const text = String(summary || "").trim();
+    if (!text) return;
+    if (!["done", "need_input", "error"].includes(resultStatus)) resultStatus = "done";
+    this.appendHistory({
+      type: "result", session_id: this.sessionId, run_id: runId,
+      status: resultStatus, summary: text.slice(0, 2000), at: isoNow(),
+    });
+    this.project.appendHistory({
+      type: "result", session_id: this.sessionId, status: resultStatus,
+      summary_preview: text.slice(0, 240), at: isoNow(),
+    });
+    const status = this.readJson(this.statusPath, {});
+    Object.assign(status, {
+      last_result: text.slice(0, 1000),
+      last_result_status: resultStatus,
+      last_result_at: isoNow(),
+      last_result_at_ms: nowMs(),
+    });
+    this.writeJsonBestEffort(this.statusPath, status);
+  }
+
+  status() {
+    const status = this.readJson(this.statusPath, {});
+    status.queue_length = this.queue().length;
+    return status;
+  }
+
+  summary(indexItem, offlineAfterMs) {
+    const status = this.status();
+    const heartbeatMs = Number(status.heartbeat_ms || 0);
+    const heartbeatAgeMs = heartbeatMs ? nowMs() - heartbeatMs : null;
+    const connected = status.state === "waiting" && heartbeatAgeMs !== null && heartbeatAgeMs <= offlineAfterMs;
+    return {
+      id: this.sessionId,
+      name: indexItem.name || this.sessionId,
+      created_at: indexItem.created_at,
+      state: status.state || "new",
+      connected,
+      heartbeat_age_ms: heartbeatAgeMs,
+      queue_length: status.queue_length || 0,
+      last_ack_id: status.last_ack_id || "",
+      last_ack_at: status.last_ack_at || "",
+      last_message_preview: status.last_message_preview || "",
+      waiter: status.waiter || null,
+    };
+  }
+}
+
+const MAX_TEXT_CONTEXT_BYTES = 256 * 1024;
+
+function readTextFile(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size > MAX_TEXT_CONTEXT_BYTES) {
+      // Cap inlined attachment context so an oversized file can't flood the
+      // agent's stdout / memory; read only the first chunk.
+      const fd = fs.openSync(filePath, "r");
+      try {
+        const buf = Buffer.alloc(MAX_TEXT_CONTEXT_BYTES);
+        const bytes = fs.readSync(fd, buf, 0, MAX_TEXT_CONTEXT_BYTES, 0);
+        return `${buf.toString("utf8", 0, bytes)}\n[...内容过长已截断：文件共 ${stat.size} 字节，仅显示前 ${MAX_TEXT_CONTEXT_BYTES} 字节...]`;
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+    return fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    return `[读取失败: ${error.message}]`;
+  }
+}
+
+function renderFileContext(filePath) {
+  const target = path.resolve(filePath.replace(/^~(?=$|[\\/])/, os.homedir()));
+  let stat;
+  try {
+    stat = fs.statSync(target);
+  } catch {
+    return `\n\n[文件不存在: ${target}]`;
+  }
+  if (stat.isDirectory()) {
+    let children;
+    try {
+      children = fs.readdirSync(target).map((child) => path.join(target, child)).sort();
+    } catch (error) {
+      children = [`[读取目录失败: ${error.message}]`];
+    }
+    return `\n\n[目录上下文: ${target}]\n${children.slice(0, 300).join("\n")}\n[/目录上下文]`;
+  }
+  if (!stat.isFile()) return `\n\n[文件不存在: ${target}]`;
+  const ext = path.extname(target).toLowerCase();
+  if (IMAGE_EXTENSIONS.has(ext)) return renderImageContext(target);
+  if (!TEXT_EXTENSIONS.has(ext)) return `\n\n[附件路径: ${target}]`;
+  return `\n\n[文件上下文: ${target}]\n${readTextFile(target)}\n[/文件上下文]`;
+}
+
+function renderImageContext(filePath) {
+  let target = path.resolve(filePath.replace(/^~(?=$|[\\/])/, os.homedir()));
+  try {
+    if (!fs.statSync(target).isFile()) return `\n\n[图片不存在: ${target}]`;
+  } catch {
+    return `\n\n[图片不存在: ${target}]`;
+  }
+  const name = path.basename(target);
+  return (
+    `\n\n[图片上下文: ${name}]\n` +
+    "图片已保存到本地。请使用 Read / 读取文件工具打开下面的路径来查看图像内容" +
+    "（这是真实的图片文件，不要当作纯文本或尝试手动解码）：\n" +
+    `${target}\n` +
+    "[/图片上下文]"
+  );
+}
+
+function renderPayload(payload) {
+  const status = payload.status || "continue";
+  if (status === "stop") return "stop";
+  const parts = [];
+  if (payload.selected_choice) parts.push(`已选择: ${payload.selected_choice}`);
+  if (payload.user_input) parts.push(payload.user_input);
+  for (const filePath of payload.file_paths || []) parts.push(renderFileContext(filePath));
+  for (const imagePath of payload.image_paths || []) parts.push(renderImageContext(imagePath));
+  if ((payload.suggested_tools || []).length) parts.push(`\n建议工具: ${payload.suggested_tools.join(", ")}`);
+  return parts.filter(Boolean).join("\n").trim();
+}
+
+const KEEPALIVE_QUESTIONS = [
+  "请用一句话描述当前项目的用途。",
+  "请说出你最近一次修改的文件名。",
+  "请确认你仍在等待会话指令，回复'待命'即可。",
+  "请简要说明当前工作目录的用途。",
+  "请回复'继续待命'以确认连接正常。",
+  "请说出今天星期几（如果不确定可以猜测）。",
+  "请用一句话总结你刚才完成的工作。",
+  "请确认你当前没有在执行任何修改操作，回复'空闲'即可。",
+];
+
+function generateKeepaliveInstruction() {
+  if (Math.random() < 0.6) {
+    const a = Math.floor(Math.random() * 999) + 1;
+    const b = Math.floor(Math.random() * 999) + 1;
+    const ops = [
+      { symbol: "+", text: "加" },
+      { symbol: "-", text: "减" },
+      { symbol: "\u00d7", text: "乘以" },
+    ];
+    const op = ops[Math.floor(Math.random() * ops.length)];
+    return `${a}${op.symbol}${b}\u7b49\u4e8e\u591a\u5c11`;
+  }
+  return KEEPALIVE_QUESTIONS[Math.floor(Math.random() * KEEPALIVE_QUESTIONS.length)];
+}
+
+function keepaliveMessage(sessionId, rerunCmd, interactive) {
+  const cmd = rerunCmd ? `\n\n请立即执行以下命令重新进入等待：\n\`${rerunCmd}\`` : "\n请立刻重新运行同一条 wait 命令";
+  if (interactive) {
+    const question = generateKeepaliveInstruction();
+    return `KEEPALIVE_NOOP:
+当前没有新的用户指令。为保持对话活跃，请简短回答以下问题，然后重新进入等待：
+
+${question}
+
+请不要修改项目。回答后${cmd}，继续等待会话 ${sessionId} 的下一条插件消息。`;
+  }
+  return `KEEPALIVE_NOOP:
+当前没有新的用户指令。请不要修改项目，也不要总结，只需要继续保持这个 Cursor 对话可用。${cmd}，继续等待会话 ${sessionId} 的下一条插件消息。`;
+}
+
+function buildRerunCmd(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report, reportStatus, interactiveKeepalive, bridgeConfig) {
+  const script = process.argv[1] || "";
+  const stateDir = project.stateDir;
+  const parts = [
+    `node "${script}" wait`,
+    `--state-dir "${stateDir}"`,
+    `--session-id ${sessionId}`,
+    `--keepalive ${keepaliveSeconds}`,
+    `--timeout ${timeoutSeconds}`,
+    `--poll ${pollSeconds}`,
+  ];
+  if (interactiveKeepalive) parts.push("--interactive-keepalive");
+  if (bridgeConfig && bridgeConfig.port && bridgeConfig.secret) {
+    parts.push(`--bridge-port ${bridgeConfig.port}`);
+    parts.push(`--bridge-secret "${bridgeConfig.secret}"`);
+  }
+  if (report) parts.push(`--report "${report}"`);
+  if (reportStatus && reportStatus !== "done") parts.push(`--report-status ${reportStatus}`);
+  return parts.join(" ");
+}
+
+function sessionBusyMessage(sessionId, ownerPid) {
+  const pid = ownerPid ? `pid ${ownerPid}` : "另一个进程";
+  // Keep the English phrase below so any older detection still matches.
+  return `SESSION_BUSY:
+会话 ${sessionId} 已有一个活动的等待进程（${pid}），通常是另一个 Cursor 对话也在用同一个 session-id。
+为避免两个对话互相抢消息，同一个会话同时只允许一个 wait（another instruction waiter is already active for this session）。
+请不要重复运行 wait、也不要去结束其它进程；请在续聊助手面板为本对话新建一个会话并复制其启动指令重开本循环，或让本对话改用一个唯一的 --session-id。`;
+}
+
+function queueSignature(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return null;
+  }
+}
+
+// Event-driven wakeup for the wait loop. We watch the *directories* that hold the
+// session and global queue files (not the files themselves: queue writes land via
+// atomic rename, which would orphan a file-bound watch) and wake the loop the
+// instant a relevant queue file changes, instead of sleeping out the whole poll
+// interval. fs.watch is best-effort -- some platforms/filesystems deliver no
+// events, or a null filename -- so the caller keeps a slower polling safety-net
+// on top of this; correctness never depends on an event actually arriving.
+function createQueueNotifier(targets) {
+  let pending = false;
+  let resolver = null;
+  let timer = null;
+
+  const fire = () => {
+    pending = true;
+    if (resolver) {
+      const resolve = resolver;
+      resolver = null;
+      if (timer) { clearTimeout(timer); timer = null; }
+      resolve();
+    }
+  };
+
+  const watchers = [];
+  for (const target of targets) {
+    try {
+      const watcher = fs.watch(target.dir, { persistent: false }, (eventType, filename) => {
+        // filename is null on some platforms -> wake unconditionally; the loop
+        // re-checks queue signatures anyway, so a spurious wake is cheap.
+        if (!filename || filename === target.file) fire();
+      });
+      watcher.on("error", () => { /* best effort; the polling safety-net covers gaps */ });
+      watchers.push(watcher);
+    } catch {
+      /* fs.watch unsupported here (e.g. some network filesystems) -> polling covers it */
+    }
+  }
+
+  return {
+    active: watchers.length > 0,
+    wait(maxMs) {
+      if (pending) { pending = false; return Promise.resolve(); }
+      return new Promise((resolve) => {
+        resolver = resolve;
+        timer = setTimeout(() => { resolver = null; timer = null; resolve(); }, Math.max(0, maxMs));
+      });
+    },
+    close() {
+      for (const watcher of watchers) { try { watcher.close(); } catch { /* ignore */ } }
+      watchers.length = 0;
+      if (timer) { clearTimeout(timer); timer = null; }
+    },
+  };
+}
+
+async function bridgeRequest(port, secret, timeoutMs) {
+  return new Promise((resolve) => {
+    const req = http.request({
+      hostname: "127.0.0.1",
+      port,
+      path: "/request",
+      method: "GET",
+      headers: { "x-chatcontinue-secret": secret },
+      timeout: timeoutMs,
+    }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        try { resolve(JSON.parse(body)); } catch { resolve(null); }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report = null, reportStatus = "done", interactiveKeepalive = false, bridgeConfig = null) {
+  sessionId = safeSessionId(sessionId);
+  project.registerSession(sessionId);
+  const session = project.session(sessionId);
+  const runId = crypto.randomUUID().replace(/-/g, "");
+  if (report) session.recordResult(report, reportStatus, runId);
+  const [acquired, owner] = session.acquireWaiter(runId);
+  if (!acquired) {
+    session.writeStatus(runId, "busy", { last_error: "another waiter is already active", active_waiter: owner });
+    console.log(sessionBusyMessage(sessionId, owner && owner.pid));
+    return 3;
+  }
+
+  const startedAtMs = nowMs();
+  const deadline = timeoutSeconds <= 0 ? null : Date.now() + timeoutSeconds * 1000;
+  const keepaliveDeadline = keepaliveSeconds <= 0 ? null : Date.now() + keepaliveSeconds * 1000;
+  const offlineAfter = Number(project.settings().offlineAfterSeconds || 15);
+  const heartbeatInterval = Math.max(1.0, Math.min(5.0, offlineAfter / 3.0, LOCK_STALE_MS / 3000.0)) * 1000;
+  session.writeStatus(runId, "waiting", { started_at: isoNow(), last_ack_id: null, keepalive_deadline_ms: keepaliveDeadline });
+  process.stdout.write(`[续聊助手] 会话 ${sessionId} 已进入等待状态，正在轮询队列…\n`);
+  let lastHeartbeat = Date.now();
+  let spinnerActive = false;
+  let lastSpinnerBeat = Date.now();
+  let spinnerIdx = 0;
+  const spinnerChars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  function clearSpinner() {
+    if (spinnerActive) { process.stdout.write("\r\x1b[K"); spinnerActive = false; }
+  }
+  function writeSpinner() {
+    const elapsed = Math.floor((Date.now() - startedAtMs) / 1000);
+    const ch = spinnerChars[spinnerIdx % spinnerChars.length];
+    spinnerIdx++;
+    process.stdout.write(`\r${ch} [续聊助手] 等待中… ${elapsed}s`);
+    spinnerActive = true;
+  }
+  let lastSessionSig = "init";
+  let lastGlobalSig = "init";
+
+  // P-3 adaptive poll: fast while active, gradually slower (up to maxPoll) after
+  // a stretch of idleness, snapping back to base on any queue change.
+  const basePoll = Math.max(50, (Number(pollSeconds) || 0.2) * 1000);
+  const maxPoll = Math.max(basePoll, Math.min(1000, basePoll * 5));
+  const idleBackoffAfter = 10000;
+  let currentPoll = basePoll;
+  let lastActivity = Date.now();
+
+  // Wake the instant a queue file changes; the adaptive poll above degrades to a
+  // safety-net for platforms/filesystems where fs.watch delivers nothing.
+  const notifier = createQueueNotifier([
+    { dir: session.dir, file: path.basename(session.queuePath) },
+    { dir: project.stateDir, file: path.basename(project.globalQueuePath) },
+  ]);
+
+  try {
+    for (;;) {
+      const now = Date.now();
+      if (now - lastSpinnerBeat >= 1000) {
+        writeSpinner();
+        lastSpinnerBeat = now;
+      }
+      if (now - lastHeartbeat >= heartbeatInterval) {
+        session.refreshWaiter(runId);
+        session.writeStatus(runId, "waiting", { uptime_ms: nowMs() - startedAtMs, keepalive_deadline_ms: keepaliveDeadline });
+        lastHeartbeat = now;
+      }
+
+      let item = null;
+      let remaining = 0;
+      let sourceQueue = "session";
+      const sessionSig = queueSignature(session.queuePath);
+      if (sessionSig !== lastSessionSig) {
+        const [popped, poppedRemaining, conclusive] = session.popNext();
+        // Advance the signature only once the pop conclusively succeeded or
+        // confirmed the queue empty; a transient lock-busy / failed write leaves
+        // it stale so the next iteration retries instead of skipping the item.
+        if (conclusive) lastSessionSig = sessionSig;
+        if (popped) {
+          item = popped;
+          remaining = poppedRemaining;
+          lastActivity = now;
+          currentPoll = basePoll;
+        }
+      }
+      if (!item) {
+        const globalSig = queueSignature(project.globalQueuePath);
+        if (globalSig !== lastGlobalSig) {
+          const [popped, poppedRemaining, conclusive] = project.popGlobal();
+          if (conclusive) lastGlobalSig = globalSig;
+          if (popped) {
+            item = popped;
+            remaining = poppedRemaining;
+            lastActivity = now;
+            currentPoll = basePoll;
+            sourceQueue = "global";
+          }
+        }
+      }
+      if (item) {
+        const payload = normalizePayload(item);
+        const rendered = renderPayload(payload);
+        const ack = {
+          id: item.id,
+          payload,
+          source: item.source,
+          source_queue: sourceQueue,
+          received_at: isoNow(),
+          received_at_ms: nowMs(),
+          remaining_queue_length: remaining,
+          session_id: sessionId,
+          run_id: runId,
+          message_preview: rendered.slice(0, 160),
+        };
+        session.appendHistory({ type: "received", ...ack });
+        project.appendHistory({ type: "received", ...ack });
+        session.writeStatus(runId, "received", {
+          last_ack_id: ack.id,
+          last_ack_at: ack.received_at,
+          last_message_preview: ack.message_preview,
+          remaining_queue_length: remaining,
+          uptime_ms: nowMs() - startedAtMs,
+        });
+        clearSpinner();
+        process.stdout.write(`${rendered}\n`);
+        return 0;
+      }
+
+      // HTTP Bridge polling: if bridge config is provided, long-poll the bridge
+      // endpoint for an instruction. This runs alongside the file-queue polling,
+      // so both mechanisms can coexist during a gradual migration.
+      if (bridgeConfig && bridgeConfig.port && bridgeConfig.secret) {
+        const bridgeTimeout = Math.min(30000, keepaliveDeadline ? Math.max(1000, keepaliveDeadline - Date.now()) : 30000);
+        const bridgeResult = await bridgeRequest(bridgeConfig.port, bridgeConfig.secret, bridgeTimeout);
+        if (bridgeResult && bridgeResult.instruction && bridgeResult.action !== "WAIT") {
+          const bridgeItem = {
+            id: bridgeResult.id || `bridge-${Date.now()}`,
+            payload: { status: "continue", user_input: bridgeResult.instruction, selected_choice: null, file_paths: [], image_paths: [], suggested_tools: [] },
+            source: "bridge",
+            target: sessionId,
+            created_at: isoNow(),
+            created_at_ms: nowMs(),
+            pid: process.pid,
+          };
+          session.appendHistory({ type: "received", ...bridgeItem, source_queue: "bridge", received_at: isoNow(), received_at_ms: nowMs(), remaining_queue_length: 0, session_id: sessionId, run_id: runId, message_preview: bridgeResult.instruction.slice(0, 160) });
+          session.writeStatus(runId, "received", {
+            last_ack_id: bridgeItem.id,
+            last_ack_at: isoNow(),
+            last_message_preview: bridgeResult.instruction.slice(0, 160),
+            remaining_queue_length: 0,
+            uptime_ms: nowMs() - startedAtMs,
+          });
+          clearSpinner();
+          process.stdout.write(`${bridgeResult.instruction}\n`);
+          return 0;
+        }
+      }
+
+      if (deadline !== null && Date.now() >= deadline) {
+        session.writeStatus(runId, "timeout", { uptime_ms: nowMs() - startedAtMs });
+        clearSpinner();
+        console.log("timeout waiting for instruction");
+        return 2;
+      }
+
+      if (keepaliveDeadline !== null && Date.now() >= keepaliveDeadline) {
+        session.appendHistory({ type: "keepalive", session_id: sessionId, run_id: runId, at: isoNow() });
+        session.writeStatus(runId, "keepalive", { last_message_preview: "KEEPALIVE_NOOP", uptime_ms: nowMs() - startedAtMs });
+        const rerunCmd = buildRerunCmd(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report, reportStatus, interactiveKeepalive, bridgeConfig);
+        clearSpinner();
+        process.stdout.write(`${keepaliveMessage(sessionId, rerunCmd, interactiveKeepalive)}\n`);
+        return 4;
+      }
+
+      if (now - lastActivity >= idleBackoffAfter) {
+        currentPoll = Math.min(maxPoll, currentPoll * 1.5);
+      }
+      // Sleep until a queue change wakes us (fs.watch) or the bounded interval
+      // elapses -- whichever comes first. The cap is the smallest of the poll
+      // cadence and the time left until the next heartbeat / keepalive / timeout,
+      // so those deadlines still fire on schedule. With fs.watch active the poll
+      // is only a safety-net, so we relax it to maxPoll to save wakeups.
+      let waitMs = notifier.active ? maxPoll : currentPoll;
+      const untilHeartbeat = heartbeatInterval - (now - lastHeartbeat);
+      if (untilHeartbeat < waitMs) waitMs = untilHeartbeat;
+      if (deadline !== null) waitMs = Math.min(waitMs, deadline - now);
+      if (keepaliveDeadline !== null) waitMs = Math.min(waitMs, keepaliveDeadline - now);
+      await notifier.wait(Math.max(1, waitMs));
+    }
+  } finally {
+    notifier.close();
+    session.releaseWaiter(runId);
+  }
+}
+
+// --- F-6 doctor ---------------------------------------------------------------
+function pythonLauncherCommand() {
+  return process.platform === "win32" ? "py" : "python3";
+}
+
+function timeSubprocess(cmd, args) {
+  const start = process.hrtime.bigint();
+  let result;
+  // Bare command names (node/py/python3) need shell PATH/PATHEXT resolution on
+  // Windows; absolute paths (process.execPath, which may contain spaces) must NOT
+  // go through the shell or the space breaks the command.
+  const useShell = process.platform === "win32" && !path.isAbsolute(cmd);
+  try {
+    result = spawnSync(cmd, args, { encoding: "utf8", timeout: 60000, shell: useShell });
+  } catch (error) {
+    return { ok: false, ms: null, error: error.message, out: "" };
+  }
+  if (result.error) {
+    const code = result.error.code === "ENOENT" ? "命令未找到" : result.error.message;
+    return { ok: false, ms: null, error: code, out: "" };
+  }
+  const ms = Number(process.hrtime.bigint() - start) / 1e6;
+  const out = ((result.stdout || "").trim() || (result.stderr || "").trim()).slice(0, 200);
+  const ok = result.status === 0;
+  return { ok, ms, error: ok ? null : `退出码 ${result.status}`, out };
+}
+
+function checkStateWritable(project) {
+  const probe = path.join(project.stateDir, `.doctor-${process.pid}-${crypto.randomUUID().replace(/-/g, "")}.tmp`);
+  const start = process.hrtime.bigint();
+  try {
+    project.ensure();
+    project.writeJsonAtomic(probe, { ok: true, at: isoNow() });
+    const data = project.readJson(probe, null);
+    const ms = Number(process.hrtime.bigint() - start) / 1e6;
+    const ok = Boolean(data) && data.ok === true;
+    return { ok, ms, error: ok ? null : "写入后读回不一致" };
+  } catch (error) {
+    return { ok: false, ms: null, error: error.message };
+  } finally {
+    try { if (fs.existsSync(probe)) fs.rmSync(probe, { force: true }); } catch { /* best effort */ }
+  }
+}
+
+function doctorFindings(report) {
+  const findings = [];
+  const nodeSelf = report.node_self || {};
+  if (typeof nodeSelf.ms === "number") {
+    findings.push(`Node 自启动 ${nodeSelf.ms.toFixed(0)}ms（这是本运行时的实际冷启动成本）。`);
+  }
+  const launcher = report.python_launcher || {};
+  const worst = typeof launcher.ms === "number" ? launcher.ms : null;
+  if (worst !== null && worst > PY_SLOW_SPAWN_MS) {
+    if (process.platform === "win32") {
+      findings.push(`Python 冷启动 ${worst.toFixed(0)}ms 偏慢，疑似杀毒软件实时扫描拖慢；改用本 Node 运行时可绕开该问题。`);
+    } else {
+      findings.push(`Python 冷启动 ${worst.toFixed(0)}ms 偏慢，可能受磁盘/IO 影响。`);
+    }
+  }
+  const nodePath = report.node_path || {};
+  if (nodePath.ok) {
+    findings.push(`PATH 中存在 node（${nodePath.out}）。`);
+  } else {
+    findings.push("PATH 中没有 node；扩展应使用 Cursor 自带 Electron(ELECTRON_RUN_AS_NODE=1) 或远程 server 的 node 来调用本运行时。");
+  }
+  const stateWrite = report.state_dir_write || {};
+  findings.push(stateWrite.ok
+    ? `状态目录可写（${typeof stateWrite.ms === "number" ? stateWrite.ms.toFixed(0) : "?"}ms）。`
+    : `状态目录写入失败：${stateWrite.error}。请检查目录权限。`);
+  return findings;
+}
+
+function runDoctor(project, sessionId) {
+  const report = {
+    runtime: "node",
+    platform: {
+      sys_platform: process.platform,
+      os: `${os.type()} ${os.release()} (${process.arch})`,
+      node_version: process.version,
+      node_executable: process.execPath,
+      is_electron: Boolean(process.versions.electron),
+      remote_hint: process.env.VSCODE_IPC_HOOK_CLI || process.env.SSH_CONNECTION ? "疑似远程/SSH 环境" : "本机",
+      state_dir: project.stateDir,
+    },
+    node_self: timeSubprocess(process.execPath, ["-e", "0"]),
+    node_path: timeSubprocess("node", ["--version"]),
+  };
+  report.python_launcher = { command: pythonLauncherCommand(), ...timeSubprocess(pythonLauncherCommand(), ["-c", "pass"]) };
+  report.state_dir_write = checkStateWritable(project);
+  if (sessionId) report.waiter = project.session(sessionId).currentWaiter();
+  report.findings = doctorFindings(report);
+  return report;
+}
+
+function renderDoctor(report) {
+  const fmt = (entry) => {
+    if (!entry) return "n/a";
+    const ms = typeof entry.ms === "number" ? `${entry.ms.toFixed(0)}ms` : "—";
+    const tag = entry.ok ? "OK" : `FAIL(${entry.error})`;
+    const extra = entry.out ? ` ${entry.out}` : "";
+    return `${tag} ${ms}${extra}`;
+  };
+  const info = report.platform;
+  const lines = [
+    "续聊助手 doctor 自检 (Node 运行时)",
+    "=".repeat(36),
+    `平台:           ${info.os}`,
+    `Node:           ${info.node_version}  ${info.is_electron ? "[Electron]" : "[node]"}`,
+    `Node 可执行:    ${info.node_executable}`,
+    `环境:           ${info.remote_hint}`,
+    `状态目录:       ${info.state_dir}`,
+    "-".repeat(36),
+    `Node 自启动:    ${fmt(report.node_self)}`,
+    `PATH node:      ${fmt(report.node_path)}`,
+    `Python[${(report.python_launcher || {}).command}]:    ${fmt(report.python_launcher)}`,
+    `状态目录可写:   ${fmt(report.state_dir_write)}`,
+    "-".repeat(36),
+    "诊断结论:",
+  ];
+  for (const finding of report.findings || []) lines.push(`  - ${finding}`);
+  return lines.join("\n");
+}
+
+// --- CLI ----------------------------------------------------------------------
+function parseArgs(argv) {
+  const args = { _: [] };
+  const booleans = new Set(["global-queue", "json", "interactive-keepalive", "bridge-mode"]);
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token.startsWith("--")) {
+      const key = token.slice(2);
+      if (booleans.has(key)) args[key] = true;
+      else args[key] = argv[++i];
+    } else {
+      args._.push(token);
+    }
+  }
+  return args;
+}
+
+function defaultStateDir() {
+  return path.join(process.cwd(), ".cursor", "local-continue-state");
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const command = argv[0] && !argv[0].startsWith("--") ? argv[0] : "";
+  const args = parseArgs(command ? argv.slice(1) : argv);
+  const stateDir = args["state-dir"] || defaultStateDir();
+  const project = new ProjectState(stateDir);
+
+  if (command === "wait") {
+    const toInt = (value, fallback) => { const n = parseInt(value, 10); return Number.isFinite(n) ? n : fallback; };
+    const toFloat = (value, fallback) => { const n = parseFloat(value); return Number.isFinite(n) ? n : fallback; };
+    const interactiveKeepalive = args["interactive-keepalive"] === true || args["interactive-keepalive"] === "true";
+    const bridgePort = toInt(args["bridge-port"], 0);
+    const bridgeSecret = args["bridge-secret"] || "";
+    const bridgeConfig = bridgePort && bridgeSecret ? { port: bridgePort, secret: bridgeSecret } : null;
+    return waitForInstruction(
+      project,
+      args["session-id"] || "agent-1",
+      toInt(args.timeout, 0),
+      toInt(args.keepalive, 90),
+      toFloat(args.poll, 0.2),
+      args.report || null,
+      args["report-status"] || "done",
+      interactiveKeepalive,
+      bridgeConfig,
+    );
+  }
+
+  if (command === "send") {
+    const payload = args.payload ? JSON.parse(args.payload) : normalizePayload(args.text || "");
+    const item = args["global-queue"]
+      ? project.enqueueGlobal(payload, "send")
+      : project.session(args["session-id"] || "agent-1").enqueue(payload, "send");
+    console.log(`queued: ${item.id}`);
+    return 0;
+  }
+
+  if (command === "status") {
+    console.log(JSON.stringify(project.statusSummary(), null, 2));
+    return 0;
+  }
+
+  if (command === "doctor") {
+    const report = runDoctor(project, args["session-id"] || null);
+    console.log(args.json ? JSON.stringify(report, null, 2) : renderDoctor(report));
+    return 0;
+  }
+
+  if (command === "clear") {
+    if (args["global-queue"] || !args["session-id"]) project.clearGlobal();
+    if (args["session-id"]) {
+      const session = project.session(args["session-id"]);
+      const lockToken = project.acquireLock(session.queueLockDir);
+      try {
+        project.writeJsonAtomic(session.queuePath, []);
+      } finally {
+        project.releaseLock(session.queueLockDir, lockToken);
+      }
+    }
+    console.log("cleared");
+    return 0;
+  }
+
+  console.error("usage: node instruction.js <wait|send|status|clear|doctor> [--state-dir DIR] [--session-id ID] ...");
+  return 1;
+}
+
+main()
+  .then((code) => {
+    // Set exitCode instead of process.exit() so a buffered stdout write (the
+    // rendered instruction can be large on a pipe) fully drains before exit.
+    process.exitCode = code || 0;
+  })
+  .catch((error) => {
+    console.error(`error: ${error && error.message ? error.message : error}`);
+    process.exitCode = 1;
+  });
