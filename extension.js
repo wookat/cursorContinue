@@ -970,6 +970,30 @@ async function copyMcpInstruction(context, sessionId) {
   return built;
 }
 
+// True when this project's .cursor/mcp.json already registers our MCP server.
+function mcpInstalled(paths) {
+  try {
+    const cfg = readJson(paths.mcpConfig, null);
+    return Boolean(cfg && cfg.mcpServers && cfg.mcpServers["local-continue"]);
+  } catch {
+    return false;
+  }
+}
+
+// The "smart" copy used by the top bar: hand back the MCP start instruction once
+// the MCP server is installed in this project, otherwise the shell one. This way
+// the single primary button always yields a command that works right now -- no
+// transport choice for the user, and it auto-upgrades to MCP after install+restart.
+async function copySmartInstruction(context, sessionId) {
+  const paths = ensureRuntime(context);
+  if (mcpInstalled(paths)) {
+    const built = await copyMcpInstruction(context, sessionId);
+    return { ...built, mode: "mcp" };
+  }
+  const built = await copyAgentInstruction(context, sessionId);
+  return { ...built, mode: "shell" };
+}
+
 function startWaitTerminal(context, sessionId) {
   const paths = ensureRuntime(context);
   const settings = readSettings(paths);
@@ -2050,15 +2074,25 @@ class PanelProvider {
         this.event(`已重命名会话为：${item.name}`);
       }
     } else if (message.type === "copyAgentInstruction") {
+      const built = await copySmartInstruction(this.context, message.sessionId || "agent-1");
+      const modeLabel = built.mode === "mcp" ? "MCP" : "shell";
+      if (built.created) {
+        this.reply({ type: "sessionCreated", session: { id: built.id } });
+        this.postStatus({ forcePatch: false });
+        this.event(`当前会话已有在线 Agent，已为新对话创建独立会话并复制其${modeLabel}启动指令（${built.id}）。`);
+        return true;
+      } else {
+        this.event(`已复制${modeLabel}启动指令（会话 ${built.id}）。${built.mode === "shell" ? "装好 MCP 配置并重启 Cursor 后会自动改用 MCP。" : ""}`);
+      }
+    } else if (message.type === "copyShellInstruction") {
       const built = await copyAgentInstruction(this.context, message.sessionId || "agent-1");
       if (built.created) {
         this.reply({ type: "sessionCreated", session: { id: built.id } });
         this.postStatus({ forcePatch: false });
-        this.event(`当前会话已有在线 Agent，已为新对话创建独立会话并复制其启动指令（${built.id}）。`);
+        this.event(`已为新对话创建独立会话并复制其 shell 启动指令（${built.id}）。`);
         return true;
-      } else {
-        this.event(`已复制启动指令（会话 ${built.id}）。`);
       }
+      this.event(`已复制 shell 启动指令（会话 ${built.id}）。`);
     } else if (message.type === "startWait") {
       const resolved = startWaitTerminal(this.context, message.sessionId || "agent-1");
       if (resolved.created) {
@@ -2282,8 +2316,8 @@ class PanelProvider {
         </div>
         <div class="header-actions">
           <button class="mini-button" id="newSession">新建会话</button>
-          <button class="mini-button primary" id="copyInstruction">复制当前会话启动指令</button>
-          <button class="mini-button" id="handoffBtn">会话转接</button>
+          <button class="mini-button" id="installMcpTop" title="把 MCP 服务器写入 .cursor/mcp.json（首次用 MCP 模式需要，装好后完全重启 Cursor）">① 安装 MCP 配置</button>
+          <button class="mini-button primary" id="copyInstruction" title="复制启动指令并发给 Cursor 对话。装了 MCP 就给 MCP 指令，否则给 shell 指令。">② 复制启动指令</button>
           <button class="mini-button" id="settingsBtn">设置</button>
           <button class="mini-button" id="moreBtn">更多</button>
         </div>
@@ -2351,6 +2385,7 @@ class PanelProvider {
             <button class="mini-button" id="startWait">启动当前会话等待终端</button>
             <button class="mini-button" id="runDoctor">运行 doctor 自检</button>
             <button class="mini-button" id="renameSession">重命名当前会话</button>
+            <button class="mini-button" id="handoffBtn">会话转接</button>
             <button class="mini-button" id="sessionSettingsBtn">当前会话参数</button>
             <button class="mini-button danger" id="deleteCurrentSession">删除当前会话</button>
             <button class="mini-button danger" id="stopLoop">停止当前会话</button>
@@ -2382,10 +2417,11 @@ class PanelProvider {
             </div>
           </section>
           <section class="advanced-section">
-            <div class="advanced-title">MCP 模式（推荐，更稳）</div>
-            <div class="advanced-note">用 MCP 工具 wait_for_instruction 替代 shell 等待命令。MCP 调用会被 Cursor 原生阻塞等待，不会被模型放到后台，能解决 GPT-5.5 等模型"看到转圈就收工"的问题。</div>
+            <div class="advanced-title">启动模式（顶部按钮已智能处理）</div>
+            <div class="advanced-note">顶部「复制启动指令」会自动判断：装了 MCP 就给 MCP 指令，否则给 shell 指令。下面是手动选择（一般不需要）。MCP 调用被 Cursor 原生阻塞等待、不会被模型放到后台，能解决 GPT-5.5 等模型"看到转圈就收工"的问题。</div>
             <button class="mini-button primary" id="installMcpBtn">安装 MCP 配置</button>
             <button class="mini-button" id="copyMcpInstructionBtn">复制 MCP 启动指令</button>
+            <button class="mini-button" id="copyShellInstructionBtn">复制 shell 启动指令</button>
           </section>
           <section class="advanced-section">
             <div class="advanced-title">HTTP Bridge 服务</div>
@@ -2404,20 +2440,9 @@ class PanelProvider {
         <div class="modal-head"><div class="modal-title">设置</div><button class="mini-button" data-close-modal="settingsDialog">关闭</button></div>
         <label class="setting-row"><span>最大并发会话数</span><input id="setMaxSessions" type="number" min="1"></label>
         <label class="setting-row"><span>默认调度策略</span><select id="setSchedulingMode"><option value="idle-first">空闲优先</option><option value="direct">当前会话</option><option value="broadcast">全部在线</option><option value="round-robin">轮询分配</option></select></label>
-        <label class="setting-row"><span>桥接运行时</span><select id="setRuntime"><option value="auto">自动（优先 Node，更快/跨平台）</option><option value="node">Node</option><option value="python">Python</option></select></label>
-        <label class="setting-row"><span>单会话队列上限</span><input id="setQueueLimit" type="number" min="1"></label>
-        <label class="setting-row"><span>空闲优先队列上限</span><input id="setGlobalQueueLimit" type="number" min="1"></label>
         <label class="setting-row"><span>保活间隔秒数</span><input id="setKeepalive" type="number" min="10"></label>
-        <label class="setting-row"><span>会话离线判定秒数</span><input id="setOfflineAfter" type="number" min="5"></label>
-        <label class="setting-row"><span>执行超时判定秒数（执行中超过此值标记为可能中断）</span><input id="setWorkingTimeout" type="number" min="30"></label>
-        <label class="setting-row"><span>等待超时秒数</span><input id="setTimeout" type="number" min="0"></label>
-        <label class="setting-row"><span>队列轮询间隔秒数</span><input id="setPoll" type="number" min="0.1" step="0.1"></label>
-        <label class="setting-row"><span>保留执行记录条数</span><input id="setHistoryLimit" type="number" min="20"></label>
-        <label class="setting-row"><span>保留粘贴图片张数</span><input id="setImageLimit" type="number" min="5"></label>
-        <label class="setting-row"><span>图片最长边上限(px, 0=不压缩)</span><input id="setImageMaxDimension" type="number" min="0" step="100"></label>
         <label class="setting-row"><span>会话需关注时弹系统通知</span><input id="setNotifyOnAttention" type="checkbox"></label>
-        <label class="setting-row"><span>保活时发送数学题/常识题</span><input id="setInteractiveKeepalive" type="checkbox"></label>
-        <label class="setting-row"><span>聊天框重试上限（每次失败最多重试次数）</span><input id="setRetryMaxRetries" type="number" min="1" max="1000"></label>
+        <div class="meta-hint">其余高级项（队列上限、离线/执行超时判定、轮询间隔、记录/图片上限、运行时、聊天框重试上限等）已采用合理默认值；确需微调可直接编辑 <code>.cursor/local-continue-state/settings.json</code>。</div>
         <div class="modal-actions"><button class="mini-button" data-close-modal="settingsDialog">取消</button><button class="mini-button primary" id="saveSettings">保存</button></div>
       </div>
     </div>

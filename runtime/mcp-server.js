@@ -22,7 +22,7 @@ const crypto = require("crypto");
 const inst = require("./instruction.js");
 
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = { name: "local-continue-续聊助手", version: "0.8.0" };
+const SERVER_INFO = { name: "local-continue-续聊助手", version: "1.0.0" };
 // Cursor hard-cuts an MCP tool call at ~60 min (-32001). Return a KEEPALIVE_NOOP a
 // bit before that so the agent re-invokes and the request never hard-fails.
 const DEFAULT_SOFT_TIMEOUT_MS = 3300 * 1000;

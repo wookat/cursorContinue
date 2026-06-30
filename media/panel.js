@@ -300,20 +300,8 @@
   function syncSettingsInputs() {
     $("setMaxSessions").value = state.settings.maxConcurrentSessions ?? 4;
     $("setSchedulingMode").value = state.settings.schedulingMode ?? "direct";
-    $("setRuntime").value = state.settings.runtime ?? "auto";
-    $("setQueueLimit").value = state.settings.perSessionQueueLimit ?? 3;
-    $("setGlobalQueueLimit").value = state.settings.globalQueueLimit ?? 20;
     $("setKeepalive").value = state.settings.keepaliveSeconds ?? 300;
-    $("setOfflineAfter").value = state.settings.offlineAfterSeconds ?? 15;
-    $("setWorkingTimeout").value = state.settings.workingTimeoutSeconds ?? 300;
-    $("setTimeout").value = state.settings.waitTimeoutSeconds ?? 0;
-    $("setPoll").value = state.settings.pollSeconds ?? 0.2;
-    $("setHistoryLimit").value = state.settings.historyLimit ?? 200;
-    $("setImageLimit").value = state.settings.imageLimit ?? 50;
-    $("setImageMaxDimension").value = state.settings.imageMaxDimension ?? 2000;
     $("setNotifyOnAttention").checked = state.settings.notifyOnAttention !== false;
-    $("setInteractiveKeepalive").checked = state.settings.interactiveKeepalive === true;
-    $("setRetryMaxRetries").value = state.settings.retryMaxRetries ?? 200;
   }
 
   function renderAttachments() {
@@ -506,24 +494,14 @@
   }
 
   function saveSettings() {
+    // Only the few visible fields are sent; the backend merges over existing
+    // settings, so all hidden advanced fields keep their current/default values.
     send("updateExtensionSettings", {
       settings: {
         maxConcurrentSessions: Number($("setMaxSessions").value || 4),
         schedulingMode: $("setSchedulingMode").value || "direct",
-        runtime: $("setRuntime").value || "auto",
-        perSessionQueueLimit: Number($("setQueueLimit").value || 3),
-        globalQueueLimit: Number($("setGlobalQueueLimit").value || 20),
         keepaliveSeconds: Number($("setKeepalive").value || 300),
-        offlineAfterSeconds: Number($("setOfflineAfter").value || 15),
-        workingTimeoutSeconds: Number($("setWorkingTimeout").value || 300),
-        waitTimeoutSeconds: Number($("setTimeout").value || 0),
-        pollSeconds: Number($("setPoll").value || 0.2),
-        historyLimit: Number($("setHistoryLimit").value || 200),
-        imageLimit: Number($("setImageLimit").value || 50),
-        imageMaxDimension: Number($("setImageMaxDimension").value || 0),
         notifyOnAttention: $("setNotifyOnAttention").checked,
-        interactiveKeepalive: $("setInteractiveKeepalive").checked,
-        retryMaxRetries: Number($("setRetryMaxRetries").value || 200),
       },
     });
     closeModal("settingsDialog");
@@ -636,6 +614,10 @@
   function bindEvents() {
     $("newSession").addEventListener("click", () => send("createSession"));
     $("copyInstruction").addEventListener("click", () => send("copyAgentInstruction", { sessionId: state.selectedSessionId }));
+    const installMcpTop = $("installMcpTop");
+    if (installMcpTop) installMcpTop.addEventListener("click", () => send("installMcp"));
+    const copyShellBtn = $("copyShellInstructionBtn");
+    if (copyShellBtn) copyShellBtn.addEventListener("click", () => send("copyShellInstruction", { sessionId: state.selectedSessionId }));
     $("settingsBtn").addEventListener("click", () => { syncSettingsInputs(); openModal("settingsDialog"); });
     $("moreBtn").addEventListener("click", () => openModal("moreDialog"));
     $("send").addEventListener("click", submit);

@@ -2,7 +2,7 @@
 
 这是一个 Cursor 续聊插件。它使用项目内的本地队列和 `instruction.js wait`（或 `instruction.py wait`）桥接 Cursor 官方 Agent 对话，让你可以在插件面板里继续发送指令、引用文件、粘贴图片，并管理多个并行 Agent 会话。
 
-## 0.8.0 主要能力
+## 1.0.0 主要能力
 
 - 多会话：每个 Cursor 官方 Agent 对话使用一个独立 `session-id`。
 - 多队列：支持 `sessions/<session-id>/queue.json` 和 `global_queue.json`。
@@ -136,6 +136,13 @@ npm run package
 打包后的 `.vsix` 会生成在项目根目录，可移入 `dist/` 目录保存。`reference/` 目录存放参考插件包供分析用，两者均不提交 git。
 
 ## 更新日志
+
+### 1.0.0
+
+首个稳定里程碑：以 MCP 为默认传输、shell 为兜底，整合并精简了 0.8.0 引入的 MCP 传输层、在线信标、会话转接、自动会话标识/标题、实时执行状态等能力。
+
+- **MCP 设为默认 + shell 兜底**：顶部主操作精简为「① 安装 MCP 配置」「② 复制启动指令」。「复制启动指令」改为**智能**——项目已装 MCP（`.cursor/mcp.json` 含 local-continue）就给 MCP 启动指令，否则给 shell 指令；用户零决策，装好 MCP 并完全重启 Cursor 后自动升级到 MCP。「会话转接」「复制 MCP/shell 启动指令（显式）」收进「更多」。
+- **设置大力精简**：设置弹窗只保留 4 项（最大并发会话数、默认调度策略、保活间隔秒数、关注时弹通知）；其余高级项（队列上限、离线/执行超时判定、轮询间隔、记录/图片上限、运行时、聊天框重试上限、交互保活）改用合理默认值并移出 UI，仍可在 `.cursor/local-continue-state/settings.json` 手改（后端按合并语义保存，隐藏项保留原值不被覆盖）。
 
 ### 0.8.0
 
