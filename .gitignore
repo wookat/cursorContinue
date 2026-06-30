@@ -13,6 +13,9 @@ __pycache__/
 *.dll
 *.node
 
+# *.vsix 兜底：防止根目录直接打包生成的 vsix 误提交
+*.vsix
+
 # 参考插件包（本地保留，不提交）
 reference/
 
