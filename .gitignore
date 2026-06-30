@@ -8,10 +8,16 @@ __pycache__/
 .vscode/
 .cursor/
 .claude/
-# *.vsix - 保留发布的插件包
 *.log
 *.exe
 *.dll
 *.node
-cursorContinue (1)/
-cursor-continue-a8-ttvet-cn-relay-0.6.0-extracted/
+
+# 参考插件包（本地保留，不提交）
+reference/
+
+# 生成的发布包（本地保留，不提交）
+dist/
+
+# 逆向分析工作文件
+.analysis-strings.txt
