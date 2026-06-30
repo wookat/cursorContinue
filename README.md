@@ -21,9 +21,34 @@
 - 性能优化：stat 签名缓存、DOM diff 渲染、CSS containment、正则预编译、紧凑 JSON 序列化等。
 - **强规则模板**：`alwaysApply: true`，包含 Shell 超时行为说明、Cursor 超时信号识别（`Waited briefly` / `Will resume`）、禁止短语、系统目录保护等硬性指令。
 
-## 基本使用
+## 项目结构
 
-1. 在 Cursor 安装 `local-continue-assistant-0.7.0.vsix`。
+```text
+cursorContinue/
+├── extension.js              # 插件主代码
+├── package.json              # 插件配置
+├── package-lock.json         # 依赖锁定
+├── media/                    # 插件 UI 资源
+│   ├── icon.svg
+│   ├── panel.css
+│   ├── panel.js
+│   └── official-retry-helper.js
+├── runtime/                  # Agent 运行时脚本
+│   ├── instruction.js
+│   ├── instruction.py
+│   └── cutc_rules_template.mdc
+├── dist/                     # 生成的发布包（不提交 git）
+├── reference/                # 参考插件包（不提交 git）
+├── LICENSE.txt
+├── README.md
+└── .gitignore
+```
+
+## 安装
+
+从 `dist/` 目录安装最新发布包，或自行打包（见下文）：
+
+1. 在 Cursor 安装 `dist/local-continue-assistant-0.7.0.vsix`。
 2. 打开任意项目目录。
 3. 打开 `续聊助手` 面板。
 4. 点击 `新建会话`，或直接使用默认的 `会话 1`。
@@ -94,6 +119,15 @@ Cursor Shell 工具可能在脚本实际完成前就返回超时（如 `Waited b
 ```
 
 复制启动指令给远程 Cursor Agent 后，Agent 会在服务器项目终端执行 `instruction.js wait`（或 `instruction.py wait`）。本机官方聊天框重试补丁只修改本机 Cursor 安装目录，不属于远程服务器能力。
+
+## 开发与打包
+
+```bash
+npm install
+npm run package
+```
+
+打包后的 `.vsix` 会生成在项目根目录，可移入 `dist/` 目录保存。`reference/` 目录存放参考插件包供分析用，两者均不提交 git。
 
 ## 更新日志
 
