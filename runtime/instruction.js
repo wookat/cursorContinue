@@ -1,22 +1,20 @@
 #!/usr/bin/env node
 "use strict";
 
-// Node port of instruction.py -- the multi-session bridge runtime.
+// The multi-session bridge runtime (Node, the shell fallback transport).
 //
 // Why Node: the agent's terminal always has a Node binary reachable (locally the
 // Cursor/Electron binary via ELECTRON_RUN_AS_NODE=1, on a Remote-SSH host the
 // Cursor server's bundled node), whereas Python is not guaranteed and, on
-// Windows, pays a heavy per-spawn antivirus cost. This runtime is byte-for-byte
-// compatible with the Python one at the level that matters: the rendered stdout,
-// the KEEPALIVE_NOOP sentinel, exit codes, and the on-disk state/queue/lock
-// layout, so the panel (extension.js) and the agent loop behave identically
-// regardless of which runtime is used. Runs the same on Windows and Linux.
+// Windows, pays a heavy per-spawn antivirus cost -- which is why the former
+// Python runtime was dropped in 1.0.1. The MCP server (mcp-server.js) reuses this
+// file's queue/session/state machine, so both transports behave identically.
+// Runs the same on Windows and Linux.
 
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const http = require("http");
 const { spawnSync, spawn } = require("child_process");
 
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"]);
@@ -706,48 +704,13 @@ function renderPayload(payload) {
   return parts.filter(Boolean).join("\n").trim();
 }
 
-const KEEPALIVE_QUESTIONS = [
-  "请用一句话描述当前项目的用途。",
-  "请说出你最近一次修改的文件名。",
-  "请确认你仍在等待会话指令，回复'待命'即可。",
-  "请简要说明当前工作目录的用途。",
-  "请回复'继续待命'以确认连接正常。",
-  "请说出今天星期几（如果不确定可以猜测）。",
-  "请用一句话总结你刚才完成的工作。",
-  "请确认你当前没有在执行任何修改操作，回复'空闲'即可。",
-];
-
-function generateKeepaliveInstruction() {
-  if (Math.random() < 0.6) {
-    const a = Math.floor(Math.random() * 999) + 1;
-    const b = Math.floor(Math.random() * 999) + 1;
-    const ops = [
-      { symbol: "+", text: "加" },
-      { symbol: "-", text: "减" },
-      { symbol: "\u00d7", text: "乘以" },
-    ];
-    const op = ops[Math.floor(Math.random() * ops.length)];
-    return `${a}${op.symbol}${b}\u7b49\u4e8e\u591a\u5c11`;
-  }
-  return KEEPALIVE_QUESTIONS[Math.floor(Math.random() * KEEPALIVE_QUESTIONS.length)];
-}
-
-function keepaliveMessage(sessionId, rerunCmd, interactive) {
+function keepaliveMessage(sessionId, rerunCmd) {
   const cmd = rerunCmd ? `\n\n请立即执行以下命令重新进入等待：\n\`${rerunCmd}\`` : "\n请立刻重新运行同一条 wait 命令";
-  if (interactive) {
-    const question = generateKeepaliveInstruction();
-    return `KEEPALIVE_NOOP:
-当前没有新的用户指令。为保持对话活跃，请简短回答以下问题，然后重新进入等待：
-
-${question}
-
-请不要修改项目。回答后${cmd}，继续等待会话 ${sessionId} 的下一条插件消息。`;
-  }
   return `KEEPALIVE_NOOP:
 当前没有新的用户指令。请不要修改项目，也不要总结，只需要继续保持这个 Cursor 对话可用。${cmd}，继续等待会话 ${sessionId} 的下一条插件消息。`;
 }
 
-function buildRerunCmd(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report, reportStatus, interactiveKeepalive, bridgeConfig) {
+function buildRerunCmd(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report, reportStatus) {
   const script = process.argv[1] || "";
   const stateDir = project.stateDir;
   const parts = [
@@ -758,11 +721,6 @@ function buildRerunCmd(project, sessionId, timeoutSeconds, keepaliveSeconds, pol
     `--timeout ${timeoutSeconds}`,
     `--poll ${pollSeconds}`,
   ];
-  if (interactiveKeepalive) parts.push("--interactive-keepalive");
-  if (bridgeConfig && bridgeConfig.port && bridgeConfig.secret) {
-    parts.push(`--bridge-port ${bridgeConfig.port}`);
-    parts.push(`--bridge-secret "${bridgeConfig.secret}"`);
-  }
   if (report) parts.push(`--report "${report}"`);
   if (reportStatus && reportStatus !== "done") parts.push(`--report-status ${reportStatus}`);
   return parts.join(" ");
@@ -838,28 +796,6 @@ function createQueueNotifier(targets) {
       if (timer) { clearTimeout(timer); timer = null; }
     },
   };
-}
-
-async function bridgeRequest(port, secret, timeoutMs) {
-  return new Promise((resolve) => {
-    const req = http.request({
-      hostname: "127.0.0.1",
-      port,
-      path: "/request",
-      method: "GET",
-      headers: { "x-chatcontinue-secret": secret },
-      timeout: timeoutMs,
-    }, (res) => {
-      let body = "";
-      res.on("data", (chunk) => { body += chunk; });
-      res.on("end", () => {
-        try { resolve(JSON.parse(body)); } catch { resolve(null); }
-      });
-    });
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => { req.destroy(); resolve(null); });
-    req.end();
-  });
 }
 
 // --- Presence beacon ----------------------------------------------------------
@@ -946,7 +882,7 @@ async function runBeacon(project, sessionId, watchPpid, intervalMs) {
   return 0;
 }
 
-async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report = null, reportStatus = "done", interactiveKeepalive = false, bridgeConfig = null) {
+async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report = null, reportStatus = "done") {
   sessionId = safeSessionId(sessionId);
   project.registerSession(sessionId);
   const session = project.session(sessionId);
@@ -1107,42 +1043,6 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
         return 0;
       }
 
-      // HTTP Bridge polling: if bridge config is provided, long-poll the bridge
-      // endpoint for an instruction. This runs alongside the file-queue polling,
-      // so both mechanisms can coexist during a gradual migration.
-      if (bridgeConfig && bridgeConfig.port && bridgeConfig.secret) {
-        // Cap the bridge long-poll well below the old 30s. The await below parks
-        // the loop on the bridge socket, so anything that lands in the *file*
-        // queue meanwhile isn't seen until it returns. A 5s ceiling keeps both
-        // channels responsive (file-queue latency ≤5s in bridge mode instead of
-        // 30s) for the price of a few extra cheap localhost round-trips, and it
-        // still shortens further as the keepalive deadline approaches.
-        const bridgeTimeout = Math.min(5000, keepaliveDeadline ? Math.max(1000, keepaliveDeadline - Date.now()) : 5000);
-        const bridgeResult = await bridgeRequest(bridgeConfig.port, bridgeConfig.secret, bridgeTimeout);
-        if (bridgeResult && bridgeResult.instruction && bridgeResult.action !== "WAIT") {
-          const bridgeItem = {
-            id: bridgeResult.id || `bridge-${Date.now()}`,
-            payload: { status: "continue", user_input: bridgeResult.instruction, selected_choice: null, file_paths: [], image_paths: [], suggested_tools: [] },
-            source: "bridge",
-            target: sessionId,
-            created_at: isoNow(),
-            created_at_ms: nowMs(),
-            pid: process.pid,
-          };
-          session.appendHistory({ type: "received", ...bridgeItem, source_queue: "bridge", received_at: isoNow(), received_at_ms: nowMs(), remaining_queue_length: 0, session_id: sessionId, run_id: runId, message_preview: bridgeResult.instruction.slice(0, 160) });
-          session.writeStatus(runId, "received", {
-            last_ack_id: bridgeItem.id,
-            last_ack_at: isoNow(),
-            last_message_preview: bridgeResult.instruction.slice(0, 160),
-            remaining_queue_length: 0,
-            uptime_ms: nowMs() - startedAtMs,
-          });
-          clearSpinner();
-          process.stdout.write(`${bridgeResult.instruction}\n`);
-          return 0;
-        }
-      }
-
       if (deadline !== null && Date.now() >= deadline) {
         session.writeStatus(runId, "timeout", { uptime_ms: nowMs() - startedAtMs });
         clearSpinner();
@@ -1153,9 +1053,9 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
       if (keepaliveDeadline !== null && Date.now() >= keepaliveDeadline) {
         session.appendHistory({ type: "keepalive", session_id: sessionId, run_id: runId, at: isoNow() });
         session.writeStatus(runId, "keepalive", { last_message_preview: "KEEPALIVE_NOOP", uptime_ms: nowMs() - startedAtMs });
-        const rerunCmd = buildRerunCmd(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report, reportStatus, interactiveKeepalive, bridgeConfig);
+        const rerunCmd = buildRerunCmd(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report, reportStatus);
         clearSpinner();
-        process.stdout.write(`${keepaliveMessage(sessionId, rerunCmd, interactiveKeepalive)}\n`);
+        process.stdout.write(`${keepaliveMessage(sessionId, rerunCmd)}\n`);
         return 4;
       }
 
@@ -1306,7 +1206,7 @@ function renderDoctor(report) {
 // --- CLI ----------------------------------------------------------------------
 function parseArgs(argv) {
   const args = { _: [] };
-  const booleans = new Set(["global-queue", "json", "interactive-keepalive", "bridge-mode"]);
+  const booleans = new Set(["global-queue", "json"]);
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
     if (token.startsWith("--")) {
@@ -1334,10 +1234,6 @@ async function main() {
   if (command === "wait") {
     const toInt = (value, fallback) => { const n = parseInt(value, 10); return Number.isFinite(n) ? n : fallback; };
     const toFloat = (value, fallback) => { const n = parseFloat(value); return Number.isFinite(n) ? n : fallback; };
-    const interactiveKeepalive = args["interactive-keepalive"] === true || args["interactive-keepalive"] === "true";
-    const bridgePort = toInt(args["bridge-port"], 0);
-    const bridgeSecret = args["bridge-secret"] || "";
-    const bridgeConfig = bridgePort && bridgeSecret ? { port: bridgePort, secret: bridgeSecret } : null;
     return waitForInstruction(
       project,
       args["session-id"] || "agent-1",
@@ -1346,8 +1242,6 @@ async function main() {
       toFloat(args.poll, 0.2),
       args.report || null,
       args["report-status"] || "done",
-      interactiveKeepalive,
-      bridgeConfig,
     );
   }
 
@@ -1413,7 +1307,6 @@ module.exports = {
   nowMs,
   isoNow,
   keepaliveMessage,
-  generateKeepaliveInstruction,
 };
 
 if (require.main === module) {

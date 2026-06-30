@@ -1,15 +1,13 @@
 # 续聊助手
 
-这是一个 Cursor 续聊插件。它使用项目内的本地队列和 `instruction.js wait`（或 `instruction.py wait`）桥接 Cursor 官方 Agent 对话，让你可以在插件面板里继续发送指令、引用文件、粘贴图片，并管理多个并行 Agent 会话。
+这是一个 Cursor 续聊插件。它使用项目内的本地队列，通过 MCP 工具 `wait_for_instruction`（推荐）或 shell 命令 `instruction.js wait`（兜底）桥接 Cursor 官方 Agent 对话，让你可以在插件面板里继续发送指令、引用文件、粘贴图片，并管理多个并行 Agent 会话。
 
-## 1.0.0 主要能力
+## 1.0.1 主要能力
 
 - 多会话：每个 Cursor 官方 Agent 对话使用一个独立 `session-id`。
 - 多队列：支持 `sessions/<session-id>/queue.json` 和 `global_queue.json`。
 - 保活：等待超过保活间隔时返回 `KEEPALIVE_NOOP`，提醒 Agent 重新进入 wait，不让对话长时间无输出而中断。
-- **交互式保活**：开启后，`KEEPALIVE_NOOP` 会附带数学题或常识题（如"3+5=?"），让 Agent 保持活跃而不只是空转。
 - **自适应心跳**：真实终端（TTY）下保留每秒 `\r` 覆盖式转圈动画；当 stdout 是管道（Agent 经 Shell 工具运行的场景）时改为约每 10 秒输出一行换行心跳，既证明进程活跃避免 Shell 误判超时，又把单个保活周期的捕获噪声从约 300 行降到约 30 行，并消除 `[K` 转义残留。
-- **HTTP Bridge 模式**：可选的实时通信模式，通过 `--bridge-port` 和 `--bridge-secret` 参数启动，延迟比文件轮询更低。
 - **MCP 传输层（推荐）**：`runtime/mcp-server.js` 暴露 MCP 工具 `wait_for_instruction`，阻塞读取同一套队列再返回下一条指令。MCP 工具调用会被 Cursor **原生阻塞等待、不会被模型放到后台**，从根上解决 GPT-5.5 等模型"看到转圈就提前结束本轮"的问题，且同一 request 内免费。面板「更多 → MCP 模式」可一键写入 `.cursor/mcp.json` 并复制 MCP 启动指令；复用现有队列/多会话/调度/转接/状态，零额外依赖。
 - 调度：支持当前会话、空闲优先、全部在线广播、轮询分配。
 - **自动获取会话标识**：等待进程从 Agent 终端的 `CURSOR_CONVERSATION_ID` 等环境变量自动捕获 Cursor 会话 ID 与工作区标签写入 `status.json`，面板会话卡片上直接显示并可一键复制，无需手动粘贴 request ID，也不读取 Cursor 私有数据库。
@@ -21,7 +19,6 @@
 - 中文 UI：设置弹窗、更多操作、执行记录、队列弹窗都在独立弹窗中显示。
 - 附件：支持引用文件、当前编辑器、工作区目录和粘贴图片。
 - 可选本机重试补丁：用于 Cursor 本机官方聊天框发送失败时的自动重试，不作用于 SSH 服务器。
-- 双运行时：`instruction.js`（Node.js，默认）和 `instruction.py`（Python，备选），Agent 可任选其一。
 - fs.watch 事件驱动：队列文件变化即时通知，无需依赖轮询；自适应退避策略在空闲时降低唤醒频率。
 - 性能优化：stat 签名缓存、DOM diff 渲染、CSS containment、正则预编译、紧凑 JSON 序列化等。
 - **强规则模板**：`alwaysApply: true`，包含 Shell 超时行为说明、Cursor 超时信号识别（`Waited briefly` / `Will resume`）、禁止短语、系统目录保护等硬性指令。
@@ -39,9 +36,8 @@ cursorContinue/
 │   ├── panel.js
 │   └── official-retry-helper.js
 ├── runtime/                  # Agent 运行时脚本
-│   ├── instruction.js
-│   ├── instruction.py
-│   ├── mcp-server.js         # MCP 传输层（wait_for_instruction 工具）
+│   ├── instruction.js        # shell 兜底运行时
+│   ├── mcp-server.js         # MCP 传输层（wait_for_instruction 工具，默认）
 │   └── cutc_rules_template.mdc
 ├── dist/                     # 生成的发布包（不提交 git）
 ├── reference/                # 参考插件包（不提交 git）
@@ -59,17 +55,13 @@ cursorContinue/
 3. 打开 `续聊助手` 面板。
 4. 点击 `新建会话`，或直接使用默认的 `会话 1`。
 5. 点击 `复制当前会话启动指令`，把复制内容发到 Cursor 官方 Agent 对话里。
-6. Agent 会按指令在项目终端执行（默认使用 Node.js 运行时）：
+6. Agent 会按指令在项目终端执行（shell 兜底模式，使用 Node.js 运行时）：
 
 ```powershell
 node ".../runtime/instruction.js" wait --state-dir ".../.cursor/local-continue-state" --session-id "agent-1" --keepalive 300 --timeout 0 --poll 0.2
 ```
 
-如果偏好 Python，也可使用：
-
-```powershell
-py ".../runtime/instruction.py" wait --state-dir ".../.cursor/local-continue-state" --session-id "agent-1" --keepalive 300 --timeout 0 --poll 0.2
-```
+> 推荐用 MCP 模式：面板「安装 MCP 配置」后完全重启 Cursor，「复制启动指令」会自动给出 MCP 启动指令（更稳，见下）。
 
 7. 面板显示在线后，你就可以在插件输入框里发送下一条指令。
 
@@ -99,7 +91,6 @@ py ".../runtime/instruction.py" wait --state-dir ".../.cursor/local-continue-sta
 - 单会话队列上限：限制每个会话积压的消息数量。
 - 空闲优先队列上限：限制全局队列积压的消息数量。
 - 保活间隔秒数：多久没有新消息时返回 `KEEPALIVE_NOOP`。
-- **保活时发送数学题/常识题**：开启后保活消息附带交互题，让 Agent 保持活跃。
 - 会话离线判定秒数：heartbeat 多久没更新就显示离线。
 - 等待超时秒数：`0` 表示不因等待超时退出，只靠保活返回。
 - 队列轮询间隔秒数：`instruction.js wait` 检查队列的间隔（有 fs.watch 时仅作安全网）。
@@ -124,7 +115,7 @@ Cursor Shell 工具可能在脚本实际完成前就返回超时（如 `Waited b
 .cursor/local-continue-state/
 ```
 
-复制启动指令给远程 Cursor Agent 后，Agent 会在服务器项目终端执行 `instruction.js wait`（或 `instruction.py wait`）。本机官方聊天框重试补丁只修改本机 Cursor 安装目录，不属于远程服务器能力。
+复制启动指令给远程 Cursor Agent 后，Agent 会在服务器项目终端执行 `instruction.js wait`（或通过 MCP 工具 `wait_for_instruction`）。本机官方聊天框重试补丁只修改本机 Cursor 安装目录，不属于远程服务器能力。
 
 ## 开发与打包
 
@@ -136,6 +127,17 @@ npm run package
 打包后的 `.vsix` 会生成在项目根目录，可移入 `dist/` 目录保存。`reference/` 目录存放参考插件包供分析用，两者均不提交 git。
 
 ## 更新日志
+
+### 1.0.1
+
+优化与瘦身轮（在 1.0.0 基础上）：
+
+- **移除 HTTP Bridge**：MCP 已覆盖其"实时通信"定位，删除 `BridgeServer` 类、启停命令、面板入口，以及 `instruction.js` 的 bridge 长轮询/参数与 `instruction.py` 的 bridge 配置。
+- **移除 Python 运行时**：Node 是默认、MCP 也是 Node，`instruction.py` 已沦为双份手工同步负担，予以删除；`resolveRuntime` 简化为仅 Node，去掉运行时选择设置。（保留 `instruction.js` 作为 shell 兜底，`mcp-server.js` 作为默认 MCP 传输。）
+- **移除交互式保活**：删掉保活时附带的数学题/常识题机制，`KEEPALIVE_NOOP` 回归纯净。
+- **MCP 不写误导的 conversation_id**：MCP 是窗口级共享进程，不再把共享/空的会话 ID 写进各会话状态。
+- **面板模式标识**：顶部新增「模式：MCP / shell」芯片（`mcpInstalled`），并将"复制启动指令"做成智能按钮（装了 MCP 给 MCP 指令，否则给 shell 指令）。
+- 说明：评估后**未做**两项——beacon 空闲跳写（会造成"已中断"误闪，收益微小）、extension 复用 instruction.js 类（收益偏内部、改核心风险高）。
 
 ### 1.0.0
 

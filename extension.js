@@ -3,7 +3,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const http = require("http");
 const { spawnSync } = require("child_process");
 
 const PATCH_START = "/* CUTC_CONTINUE_RETRY_PATCH_START */";
@@ -28,12 +27,8 @@ const DEFAULT_SETTINGS = {
   imageLimit: 50,
   imageMaxDimension: 2000,
   notifyOnAttention: true,
-  runtime: "auto",
-  interactiveKeepalive: false,
   retryMaxRetries: 200,
 };
-
-const RUNTIME_CHOICES = ["auto", "node", "python"];
 
 let retryPatchCache = { at: 0, value: null };
 
@@ -277,7 +272,6 @@ function getPaths(context) {
   return {
     workspaceRoot,
     runtimeDir,
-    instruction: path.join(runtimeDir, "instruction.py"),
     instructionJs: path.join(runtimeDir, "instruction.js"),
     mcpServerJs: path.join(runtimeDir, "mcp-server.js"),
     mcpConfig: path.join(workspaceRoot, ".cursor", "mcp.json"),
@@ -318,8 +312,8 @@ function ensureRuntime(context) {
   const cacheKey = paths.workspaceRoot || paths.stateDir;
   const cached = _runtimeCache.get(cacheKey);
   if (cached) return cached;
-  if (!fs.existsSync(paths.instruction) && !fs.existsSync(paths.instructionJs)) {
-    throw new Error(`找不到运行时脚本：${paths.instructionJs} 或 ${paths.instruction}`);
+  if (!fs.existsSync(paths.instructionJs)) {
+    throw new Error(`找不到运行时脚本：${paths.instructionJs}`);
   }
   fs.mkdirSync(paths.stateDir, { recursive: true });
   fs.mkdirSync(paths.sessionsDir, { recursive: true });
@@ -328,38 +322,24 @@ function ensureRuntime(context) {
   return paths;
 }
 
-function pythonCommand() {
-  return process.platform === "win32" ? "py" : "python3";
-}
-
 function quoteArg(value) {
   return `"${String(value).replace(/"/g, '\\"')}"`;
 }
 
-// Pick the runtime that runs the bridge in the agent's terminal.
-// Node is preferred ("auto"): in the Cursor integrated terminal `node` resolves
-// to Cursor's bundled node (locally the helper node.exe, on a Remote-SSH host the
-// server's node), so it is reliably present on both Windows and Linux and avoids
-// the per-spawn antivirus cost that makes the Python launcher slow on Windows.
-// Falls back to Python when the Node runtime file is absent (older install) or
-// when the user explicitly forces "python".
-function resolveRuntime(paths, settings) {
-  const preference = (settings && settings.runtime) || "auto";
-  const hasJs = fs.existsSync(paths.instructionJs);
-  const hasPy = fs.existsSync(paths.instruction);
-  let kind;
-  if (preference === "python") kind = hasPy ? "python" : (hasJs ? "node" : "python");
-  else if (preference === "node") kind = hasJs ? "node" : (hasPy ? "python" : "node");
-  else kind = hasJs ? "node" : "python";
-  if (kind === "node") return { kind, bin: "node", script: paths.instructionJs };
-  return { kind, bin: pythonCommand(), script: paths.instruction };
+// The runtime that runs the bridge in the agent's terminal is always Node:
+// `node` in the Cursor integrated terminal resolves to Cursor's bundled node
+// (locally the helper node.exe, on a Remote-SSH host the server's node), so it is
+// reliably present on Windows and Linux and avoids the per-spawn antivirus cost
+// that made the old Python runtime slow on Windows. (The Python runtime was
+// removed in 1.0.1 to end the dual-maintenance burden.)
+function resolveRuntime(paths) {
+  return { kind: "node", bin: "node", script: paths.instructionJs };
 }
 
 function runtimeWaitCommand(paths, settings, sessionId, extra = "") {
   const runtime = resolveRuntime(paths, settings);
   const id = safeSessionId(sessionId || "agent-1");
-  let base = `${runtime.bin} ${quoteArg(runtime.script)} wait --state-dir ${quoteArg(paths.stateDir)} --session-id ${quoteArg(id)} --keepalive ${settings.keepaliveSeconds} --timeout ${settings.waitTimeoutSeconds} --poll ${settings.pollSeconds}`;
-  if (settings.interactiveKeepalive) base += " --interactive-keepalive";
+  const base = `${runtime.bin} ${quoteArg(runtime.script)} wait --state-dir ${quoteArg(paths.stateDir)} --session-id ${quoteArg(id)} --keepalive ${settings.keepaliveSeconds} --timeout ${settings.waitTimeoutSeconds} --poll ${settings.pollSeconds}`;
   return extra ? `${base} ${extra}` : base;
 }
 
@@ -383,12 +363,10 @@ function readSettings(paths) {
   settings.imageLimit = Math.max(5, Number(settings.imageLimit || 50));
   settings.imageMaxDimension = Number.isFinite(Number(settings.imageMaxDimension)) ? Math.max(0, Math.round(Number(settings.imageMaxDimension))) : 2000;
   settings.notifyOnAttention = settings.notifyOnAttention !== false;
-  settings.interactiveKeepalive = settings.interactiveKeepalive === true;
   settings.retryMaxRetries = Math.min(1000, Math.max(1, Math.round(Number(settings.retryMaxRetries || 200) || 200)));
   if (!["direct", "broadcast", "idle-first", "round-robin"].includes(settings.schedulingMode)) {
     settings.schedulingMode = "direct";
   }
-  if (!RUNTIME_CHOICES.includes(settings.runtime)) settings.runtime = "auto";
   return settings;
 }
 
@@ -408,10 +386,8 @@ function saveSettings(context, settingsPatch) {
   cleaned.imageLimit = Math.max(5, Number(cleaned.imageLimit || 50));
   cleaned.imageMaxDimension = Number.isFinite(Number(cleaned.imageMaxDimension)) ? Math.max(0, Math.round(Number(cleaned.imageMaxDimension))) : 2000;
   cleaned.notifyOnAttention = cleaned.notifyOnAttention !== false;
-  cleaned.interactiveKeepalive = cleaned.interactiveKeepalive === true;
   cleaned.retryMaxRetries = Math.min(1000, Math.max(1, Math.round(Number(cleaned.retryMaxRetries || 200) || 200)));
   if (!["direct", "broadcast", "idle-first", "round-robin"].includes(cleaned.schedulingMode)) cleaned.schedulingMode = "direct";
-  if (!RUNTIME_CHOICES.includes(cleaned.runtime)) cleaned.runtime = "auto";
   writeJsonAtomic(paths.settings, cleaned);
   trimJsonl(paths.history, cleaned.historyLimit);
   cleanupImages(paths.images, cleaned.imageLimit);
@@ -908,7 +884,7 @@ ${waitCmd} --report "一句话说明刚完成或遇到的情况" --report-status
    - 只看到 \`[续聊助手] 等待中… Ns\` 转圈**不代表完成**，那只是心跳。**绝不要**因为看到转圈就回复"已进入等待循环 / 后台已在运行"之类然后结束本轮——那样循环会空转死掉。
    - 如果你的工具把命令放到后台并提前把控制权还给你（你只看到转圈、没有上面任一结果），它**还在运行**：请继续等待 / 重新查看**同一个后台命令**的输出（await/轮询同一条命令）直到它打印出结果，**不要另起一条新的 wait**（会 SESSION_BUSY）。
    - 请尽量用**前台 / 阻塞**方式运行，并把超时设到你的工具支持的**最长值**（如 timeout=0 或很大的值）。
-5. 如果输出以 KEEPALIVE_NOOP 开头，表示当前没有新的用户指令。不要修改项目，请立即重新运行 wait 命令（可不带 --report），让本对话保持活跃。如果 KEEPALIVE_NOOP 后面附带了一道数学题或常识题，请简短回答（如"3+5=8"），然后重新运行 wait 命令。
+5. 如果输出以 KEEPALIVE_NOOP 开头，表示当前没有新的用户指令。不要修改项目，请立即重新运行 wait 命令（可不带 --report），让本对话保持活跃。
 6. 如果输出普通文本、文件上下文或图片上下文，请执行收到的指令；执行完成后回到第 3/4 步继续等待。图片上下文会给出本地图片文件路径，请用读取文件工具打开查看。
 7. 如果收到 stop，结束这个会话循环。
 8. 如果输出以 SESSION_BUSY 开头（或包含 another instruction waiter is already active），说明本 session-id 已被另一个对话占用。不要重复运行 wait、也不要去结束其它进程；请用 --report-status need_input 反馈，并提醒我为本对话改用唯一的 session-id（或在面板新建会话后重开本循环），然后停止本轮等待。`;
@@ -1121,6 +1097,7 @@ function getBridgeStatus(context, options = {}) {
     extensionSettings: settings,
     patch: patchStatusWithNative(context, options.forcePatch),
     remoteName: vscode.env.remoteName || "",
+    mcpInstalled: mcpInstalled(paths),
   };
 }
 
@@ -1748,207 +1725,6 @@ class WorkspaceTools {
   }
 }
 
-// ---------------------------------------------------------------------------
-// BridgeServer — optional HTTP bridge server for real-time agent communication.
-// Replaces file-polling with a long-poll HTTP endpoint. Port is derived from
-// the workspace path hash to avoid conflicts between multiple workspaces.
-// Ported from cursor-continue 0.6.0's fe class.
-// ---------------------------------------------------------------------------
-
-class BridgeServer {
-  constructor(stateDir, outputChannel) {
-    this.stateDir = stateDir;
-    this.output = outputChannel;
-    this.server = null;
-    this.port = 0;
-    this.secret = crypto.randomBytes(24).toString("hex");
-    this.keepaliveSeconds = 0;
-    this.keepaliveTimer = null;
-    this.pendingResolver = null;
-    this.lastObservedPromptId = null;
-    this.dialogState = { activeRequest: null, queuedResponses: [] };
-    this._snapshot = { connected: false, listening: false };
-    this._listeners = new Set();
-  }
-
-  static computePort(workspacePath) {
-    const hash = crypto.createHash("sha256").update(workspacePath).digest();
-    const num = hash.readUInt32BE(0);
-    return 47000 + (num % 1000);
-  }
-
-  getPort() { return this.port; }
-  getSecret() { return this.secret; }
-  isListening() { return Boolean(this.server && this.server.listening); }
-
-  setKeepaliveSeconds(seconds) {
-    this.keepaliveSeconds = seconds;
-    this._resetKeepaliveTimer();
-  }
-
-  _resetKeepaliveTimer() {
-    if (this.keepaliveTimer) { clearInterval(this.keepaliveTimer); this.keepaliveTimer = null; }
-    if (this.keepaliveSeconds > 0 && this.isListening()) {
-      this.keepaliveTimer = setInterval(() => this._fireKeepalive(), this.keepaliveSeconds * 1000);
-    }
-  }
-
-  _fireKeepalive() {
-    if (!this.pendingResolver) return;
-    const questions = [
-      "请用一句话描述当前项目的用途。",
-      "请回复'待命'以确认连接正常。",
-      "请说出你最近一次修改的文件名。",
-    ];
-    const question = questions[Math.floor(Math.random() * questions.length)];
-    const keepalivePayload = {
-      id: `keepalive-${Date.now()}`,
-      instruction: `KEEPALIVE_NOOP:\n${question}\n请简短回答后继续等待。`,
-      isKeepalive: true,
-    };
-    this.pendingResolver({ id: this.dialogState.activeRequest?.id ?? "", action: "END", instruction: keepalivePayload.instruction });
-    this.pendingResolver = null;
-  }
-
-  isAuthorized(req) {
-    const headerSecret = typeof req.headers["x-chatcontinue-secret"] === "string"
-      ? req.headers["x-chatcontinue-secret"].trim() : "";
-    if (!this.secret || !headerSecret) return false;
-    const a = Buffer.from(this.secret, "utf8");
-    const b = Buffer.from(headerSecret, "utf8");
-    if (a.length !== b.length) return false;
-    return crypto.timingSafeEqual(a, b);
-  }
-
-  async start() {
-    if (this.isListening()) return;
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || this.stateDir;
-    this.port = BridgeServer.computePort(workspaceRoot);
-    return new Promise((resolve, reject) => {
-      const server = http.createServer((req, res) => this._handle(req, res));
-      server.on("error", (err) => {
-        this.output.appendLine(`[Bridge] 服务器错误: ${err.message}`);
-        reject(err);
-      });
-      server.listen(this.port, "127.0.0.1", () => {
-        this.server = server;
-        this._snapshot.listening = true;
-        this.output.appendLine(`[Bridge] HTTP 服务已启动: http://127.0.0.1:${this.port}`);
-        this._resetKeepaliveTimer();
-        this._notifyListeners();
-        resolve();
-      });
-    });
-  }
-
-  async stop() {
-    if (this.keepaliveTimer) { clearInterval(this.keepaliveTimer); this.keepaliveTimer = null; }
-    if (this.pendingResolver) {
-      this.pendingResolver({ id: "", action: "END", instruction: "[服务已停止]" });
-      this.pendingResolver = null;
-    }
-    if (this.server) {
-      await new Promise((resolve) => this.server.close(() => {
-        this.server = null;
-        this._snapshot.listening = false;
-        this._snapshot.connected = false;
-        this._notifyListeners();
-        resolve();
-      }));
-    }
-  }
-
-  _handle(req, res) {
-    if (!this.isAuthorized(req)) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "unauthorized" }));
-      return;
-    }
-    const url = new URL(req.url, `http://127.0.0.1:${this.port}`);
-    if (req.method === "GET" && url.pathname === "/request") {
-      this._handleRequest(req, res);
-    } else if (req.method === "POST" && url.pathname === "/response") {
-      this._handleResponse(req, res);
-    } else if (req.method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, port: this.port }));
-    } else {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "not found" }));
-    }
-  }
-
-  _handleRequest(req, res) {
-    // Long-poll: keep the connection open until a payload arrives or keepalive fires.
-    this._snapshot.connected = true;
-    this._notifyListeners();
-    const resolve = (payload) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(payload));
-      this._snapshot.connected = false;
-      this._notifyListeners();
-    };
-    this.pendingResolver = resolve;
-    // Safety timeout: 120s max per long-poll request.
-    setTimeout(() => {
-      if (this.pendingResolver === resolve) {
-        this.pendingResolver = null;
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ id: "", action: "WAIT", instruction: "" }));
-        this._snapshot.connected = false;
-        this._notifyListeners();
-      }
-    }, 120000);
-  }
-
-  _handleResponse(req, res) {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk; if (body.length > 1048576) req.destroy(); });
-    req.on("end", () => {
-      try {
-        const data = JSON.parse(body);
-        // Submit a response to the active request
-        if (this.pendingResolver) {
-          this.pendingResolver({ id: data.id || "", action: data.action || "END", instruction: data.instruction || "" });
-          this.pendingResolver = null;
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (err) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
-      }
-    });
-  }
-
-  submitResponse(payload) {
-    if (this.pendingResolver) {
-      this.pendingResolver(payload);
-      this.pendingResolver = null;
-      return true;
-    }
-    return false;
-  }
-
-  enqueueResponse(payload) {
-    this.dialogState.queuedResponses.push({ id: `q-${Date.now()}`, payload });
-  }
-
-  getSnapshot() { return { ...this._snapshot }; }
-  getDialogState() { return { ...this.dialogState }; }
-
-  onDidChangeSnapshot(callback) {
-    this._listeners.add(callback);
-    return () => this._listeners.delete(callback);
-  }
-
-  _notifyListeners() {
-    for (const cb of this._listeners) {
-      try { cb(); } catch { /* best effort */ }
-    }
-  }
-}
-
 class PanelProvider {
   constructor(context) {
     this.context = context;
@@ -2200,14 +1976,6 @@ class PanelProvider {
       const tools = this._getWorkspaceTools();
       const summary = await tools.buildWorkspaceSummary();
       this.reply({ type: "workspaceSummary", summary });
-    } else if (message.type === "startBridge") {
-      await this._startBridge();
-      this.event("HTTP Bridge 服务已启动。");
-    } else if (message.type === "stopBridge") {
-      await this._stopBridge();
-      this.event("HTTP Bridge 服务已停止。");
-    } else if (message.type === "getBridgeStatus") {
-      this.reply({ type: "bridgeStatus", status: this._getBridgeStatus() });
     }
     return false;
   }
@@ -2260,32 +2028,6 @@ class PanelProvider {
     return this._workspaceTools;
   }
 
-  async _startBridge() {
-    if (!this._bridgeServer) {
-      const paths = ensureRuntime(this.context);
-      const ch = vscode.window.createOutputChannel("local-continue-bridge");
-      this._bridgeServer = new BridgeServer(paths.stateDir, ch);
-    }
-    if (!this._bridgeServer.isListening()) {
-      await this._bridgeServer.start();
-      const paths = ensureRuntime(this.context);
-      const settings = readSettings(paths);
-      this._bridgeServer.setKeepaliveSeconds(Number(settings.keepaliveSeconds || 300));
-    }
-  }
-
-  async _stopBridge() {
-    if (this._bridgeServer) {
-      await this._bridgeServer.stop();
-    }
-  }
-
-  _getBridgeStatus() {
-    if (!this._bridgeServer) return { listening: false, connected: false, port: 0 };
-    const snap = this._bridgeServer.getSnapshot();
-    return { listening: snap.listening, connected: snap.connected, port: this._bridgeServer.getPort() };
-  }
-
   html(webview) {
     const nonce = String(Date.now());
     const cssUri = webview.asWebviewUri(vscode.Uri.file(path.join(this.context.extensionPath, "media", "panel.css")));
@@ -2309,6 +2051,7 @@ class PanelProvider {
               <div class="title">续聊助手</div>
               <span id="onlinePill" class="status-pill">在线会话 0/0</span>
               <span id="queuePill" class="meta-chip">待消费 0</span>
+              <span id="modePill" class="meta-chip" title="启动模式：装了 MCP 配置走 MCP（更稳），否则走 shell">模式：shell</span>
               <span id="patchState" class="meta-chip">重试助手：未知</span>
             </div>
             <div id="workspace" class="subtitle">等待打开项目</div>
@@ -2422,14 +2165,6 @@ class PanelProvider {
             <button class="mini-button primary" id="installMcpBtn">安装 MCP 配置</button>
             <button class="mini-button" id="copyMcpInstructionBtn">复制 MCP 启动指令</button>
             <button class="mini-button" id="copyShellInstructionBtn">复制 shell 启动指令</button>
-          </section>
-          <section class="advanced-section">
-            <div class="advanced-title">HTTP Bridge 服务</div>
-            <div class="advanced-note">可选的 HTTP 长轮询服务，替代文件轮询，实时通信。</div>
-            <span id="bridgeStatus" class="meta-chip">Bridge 未启动</span>
-            <button class="mini-button primary" id="startBridgeBtn">启动 Bridge</button>
-            <button class="mini-button" id="stopBridgeBtn">停止 Bridge</button>
-            <button class="mini-button" id="refreshBridgeBtn">刷新状态</button>
           </section>
         </div>
       </div>
@@ -2571,14 +2306,6 @@ function activate(context) {
       const tools = new WorkspaceTools(ch);
       const summary = await tools.buildWorkspaceSummary();
       vscode.window.showInformationMessage(summary.slice(0, 200));
-    }),
-    vscode.commands.registerCommand("localContinue.startBridge", async () => {
-      await provider._startBridge();
-      vscode.window.showInformationMessage("HTTP Bridge 服务已启动。");
-    }),
-    vscode.commands.registerCommand("localContinue.stopBridge", async () => {
-      await provider._stopBridge();
-      vscode.window.showInformationMessage("HTTP Bridge 服务已停止。");
     })
   );
   maybeAutoReinstallPatch(context);

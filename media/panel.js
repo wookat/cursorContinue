@@ -164,6 +164,9 @@
     setTextIfChanged($("onlinePill"), onlineText);
     setClassIfChanged($("onlinePill"), onlineClass);
     setTextIfChanged($("queuePill"), `待消费 ${status.totalQueueLength || 0}`);
+    const mcpOn = status.mcpInstalled === true;
+    setTextIfChanged($("modePill"), mcpOn ? "模式：MCP" : "模式：shell");
+    setClassIfChanged($("modePill"), mcpOn ? "meta-chip meta-chip-ready" : "meta-chip");
     const patchLabelTxt = patchLabel(status.patch);
     const patchClass = status.patch && status.patch.installed ? "meta-chip meta-chip-ready" : "meta-chip";
     setTextIfChanged($("patchState"), patchLabelTxt);
@@ -448,7 +451,7 @@
       state._lastEventsSig = eventsSig;
       $("events").innerHTML = latest.length
         ? latest.map((entry) => `<div class="event-line">[${escapeHtml(entry.at)}] ${escapeHtml(entry.text)}</div>`).join("")
-        : '<div class="event-line">保活说明：等待超过保活间隔后，Agent 会收到 KEEPALIVE_NOOP（可能附带数学题或常识题）并重新运行 wait。</div>';
+        : '<div class="event-line">保活说明：等待超过保活间隔后，Agent 会收到 KEEPALIVE_NOOP 并重新运行 wait。</div>';
     }
     if (!$("eventDialog").classList.contains("hidden")) {
       const historySig = state.events.length;
@@ -600,17 +603,6 @@
     closeModal("handoffDialog");
   }
 
-  function renderBridgeStatus() {
-    const el = $("bridgeStatus");
-    if (!el) return;
-    const s = state.bridgeStatus || {};
-    const text = s.listening
-      ? `Bridge :${s.port} ${s.connected ? "已连接" : "空闲"}`
-      : "Bridge 未启动";
-    setTextIfChanged(el, text);
-    el.className = `meta-chip ${s.listening ? "meta-chip-ready" : ""}`;
-  }
-
   function bindEvents() {
     $("newSession").addEventListener("click", () => send("createSession"));
     $("copyInstruction").addEventListener("click", () => send("copyAgentInstruction", { sessionId: state.selectedSessionId }));
@@ -720,13 +712,6 @@
       const query = $("workspaceSearchInput")?.value?.trim();
       if (query) send("workspaceSearch", { query, maxResults: 50 });
     });
-    // Bridge server
-    const startBridgeBtn = $("startBridgeBtn");
-    if (startBridgeBtn) startBridgeBtn.addEventListener("click", () => send("startBridge"));
-    const stopBridgeBtn = $("stopBridgeBtn");
-    if (stopBridgeBtn) stopBridgeBtn.addEventListener("click", () => send("stopBridge"));
-    const refreshBridgeBtn = $("refreshBridgeBtn");
-    if (refreshBridgeBtn) refreshBridgeBtn.addEventListener("click", () => send("getBridgeStatus"));
   }
 
   window.addEventListener("message", (event) => {
@@ -769,10 +754,6 @@
     }
     if (data.type === "workspaceSummary") {
       state.workspaceSummary = data.summary || "";
-    }
-    if (data.type === "bridgeStatus") {
-      state.bridgeStatus = data.status || {};
-      renderBridgeStatus();
     }
   });
 

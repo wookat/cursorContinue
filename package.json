@@ -2,7 +2,7 @@
   "name": "local-continue-assistant",
   "displayName": "续聊助手",
   "description": "Cursor 续聊助手：队列、握手、状态反馈、附件输入、图片粘贴和官方聊天框重试助手。",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "local-codex",
   "license": "MIT",
   "engines": {
@@ -81,14 +81,6 @@
       {
         "command": "localContinue.workspaceSummary",
         "title": "续聊助手：生成工作区摘要"
-      },
-      {
-        "command": "localContinue.startBridge",
-        "title": "续聊助手：启动 HTTP Bridge"
-      },
-      {
-        "command": "localContinue.stopBridge",
-        "title": "续聊助手：停止 HTTP Bridge"
       }
     ]
   },
@@ -107,7 +99,6 @@
     "media/panel.css",
     "media/panel.js",
     "media/official-retry-helper.js",
-    "runtime/instruction.py",
     "runtime/instruction.js",
     "runtime/mcp-server.js",
     "runtime/cutc_rules_template.mdc"

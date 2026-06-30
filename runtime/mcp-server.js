@@ -22,7 +22,7 @@ const crypto = require("crypto");
 const inst = require("./instruction.js");
 
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = { name: "local-continue-续聊助手", version: "1.0.0" };
+const SERVER_INFO = { name: "local-continue-续聊助手", version: "1.0.1" };
 // Cursor hard-cuts an MCP tool call at ~60 min (-32001). Return a KEEPALIVE_NOOP a
 // bit before that so the agent re-invokes and the request never hard-fails.
 const DEFAULT_SOFT_TIMEOUT_MS = 3300 * 1000;
@@ -85,9 +85,11 @@ async function waitForInstructionMcp(project, sessionId, opts) {
   session.writeStatus(runId, "waiting", {
     started_at: inst.isoNow(),
     transport: "mcp",
-    conversation_id: agentEnv.conversation_id,
+    // The MCP server is a single window-level process, not a per-conversation
+    // agent terminal, so CURSOR_CONVERSATION_ID would be empty or shared across
+    // every session here -- writing it would show the same (misleading) id on all
+    // MCP sessions, so we intentionally omit it. workspace_label is window-correct.
     workspace_label: agentEnv.workspace_label,
-    cursor_agent: agentEnv.cursor_agent,
     keepalive_deadline_ms: keepaliveDeadline,
   });
 
