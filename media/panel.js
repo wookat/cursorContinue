@@ -154,8 +154,8 @@
     const patch = status.patch || {};
     const retryNoteText = patch.remote
       ? "Remote SSH 下此功能不作用于服务器，请在本机 Cursor 窗口安装。"
-      : patch.installed && patch.native
-        ? `已写入：P1 跳过付费墙 ${patch.native.p1 ? "✓" : "✗"} · P2 无限重试 ${patch.native.p2 ? "✓" : "✗"} · P3 50ms 间隔 ${patch.native.p3 ? "✓" : "✗"}。若没看到图标，请完全退出并重启 Cursor（不是重载窗口）。`
+      : patch.installed
+        ? "已写入：付费墙/402/限流 自动重试并自动隐藏错误（native 断路器 5000次/波 + DOM 自动隐藏 + 定期GC回收防OOM）。若没看到图标，请完全退出并重启 Cursor（不是重载窗口）。"
         : "点「注入图标 / 修复」写入本机 Cursor 官方聊天框；装好后需完全重启 Cursor。不作用于 SSH 服务器。";
     setTextIfChanged($("retryNote"), retryNoteText);
 
@@ -279,6 +279,7 @@
     $("setImageMaxDimension").value = state.settings.imageMaxDimension ?? 2000;
     $("setNotifyOnAttention").checked = state.settings.notifyOnAttention !== false;
     $("setInteractiveKeepalive").checked = state.settings.interactiveKeepalive === true;
+    $("setRetryMaxRetries").value = state.settings.retryMaxRetries ?? 200;
   }
 
   function renderAttachments() {
@@ -487,6 +488,7 @@
         imageMaxDimension: Number($("setImageMaxDimension").value || 0),
         notifyOnAttention: $("setNotifyOnAttention").checked,
         interactiveKeepalive: $("setInteractiveKeepalive").checked,
+        retryMaxRetries: Number($("setRetryMaxRetries").value || 200),
       },
     });
     closeModal("settingsDialog");

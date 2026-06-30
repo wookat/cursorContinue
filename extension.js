@@ -29,6 +29,7 @@ const DEFAULT_SETTINGS = {
   notifyOnAttention: true,
   runtime: "auto",
   interactiveKeepalive: false,
+  retryMaxRetries: 200,
 };
 
 const RUNTIME_CHOICES = ["auto", "node", "python"];
@@ -378,6 +379,7 @@ function readSettings(paths) {
   settings.imageMaxDimension = Number.isFinite(Number(settings.imageMaxDimension)) ? Math.max(0, Math.round(Number(settings.imageMaxDimension))) : 2000;
   settings.notifyOnAttention = settings.notifyOnAttention !== false;
   settings.interactiveKeepalive = settings.interactiveKeepalive === true;
+  settings.retryMaxRetries = Math.min(1000, Math.max(1, Math.round(Number(settings.retryMaxRetries || 200) || 200)));
   if (!["direct", "broadcast", "idle-first", "round-robin"].includes(settings.schedulingMode)) {
     settings.schedulingMode = "direct";
   }
@@ -401,6 +403,7 @@ function saveSettings(context, settingsPatch) {
   cleaned.imageMaxDimension = Number.isFinite(Number(cleaned.imageMaxDimension)) ? Math.max(0, Math.round(Number(cleaned.imageMaxDimension))) : 2000;
   cleaned.notifyOnAttention = cleaned.notifyOnAttention !== false;
   cleaned.interactiveKeepalive = cleaned.interactiveKeepalive === true;
+  cleaned.retryMaxRetries = Math.min(1000, Math.max(1, Math.round(Number(cleaned.retryMaxRetries || 200) || 200)));
   if (!["direct", "broadcast", "idle-first", "round-robin"].includes(cleaned.schedulingMode)) cleaned.schedulingMode = "direct";
   if (!RUNTIME_CHOICES.includes(cleaned.runtime)) cleaned.runtime = "auto";
   writeJsonAtomic(paths.settings, cleaned);
@@ -1072,13 +1075,35 @@ function patchStatusWithNative(context, force) {
 // Patches Cursor's own workbench.desktop.main.js so retries happen at the
 // request layer instead of only via DOM clicks:
 //   P1: don't throw the paywall error while in endless-retry mode
-//   P2: force getSmokeTestEndlessRetries() to always return true
-//   P3: pin the retry delay to 50ms
+//   P2: high-capacity circuit breaker. Returns true for 5000 attempts (~4 min
+//       at 50ms), then false ONCE so the request completes and its object graph
+//       is released for GC. The DOM helper instantly resets globalThis.__lcaNR
+//       and clicks retry, starting a fresh native wave. The user never sees the
+//       ~1-2s gap (auto-hide + hidden popup). This is functionally infinite retry
+//       but prevents the monotonic JS-heap growth that caused the 0.7.0 OOM.
+//   P3: pin the retry delay to 50ms (fast retry). The rate-limit messages this
+//       can produce are auto-hidden by the DOM helper.
 // These only match/modify Cursor's own code (no external binary or license).
 const NATIVE_P2_FROM = "getSmokeTestEndlessRetries(){if(this.environmentService.smokeTestNalEndlessRetries)return()=>!0}";
-const NATIVE_P2_TO = "getSmokeTestEndlessRetries(){return()=>!0}";
+// 5000 retries * 50ms = ~4.2 min per wave before one GC-friendly completion.
+const NATIVE_P2_WAVE_LIMIT = 5000;
+const NATIVE_P2_TO = "getSmokeTestEndlessRetries(){return()=>{var g=globalThis,s=g.__lcaNR||(g.__lcaNR={n:0,t:0}),t=Date.now();if(t-s.t>2500)s.n=0;s.t=t;return++s.n<=" + NATIVE_P2_WAVE_LIMIT + "}}";
+// 0.7.0/0.7.5 shipped a truly unbounded P2 (always true); keep the literal so
+// applyNativePatch can upgrade it to the circuit breaker and removeNativePatch
+// can revert installs made by them.
+const NATIVE_P2_TO_LEGACY_INFINITE = "getSmokeTestEndlessRetries(){return()=>!0}";
+// 0.7.2–0.7.4 shipped a bounded P2 (maxRetries=200); keep the literal for the
+// same reason.
+const NATIVE_P2_TO_BOUNDED = "getSmokeTestEndlessRetries(){return()=>{var g=globalThis,s=g.__lcaNR||(g.__lcaNR={n:0,t:0}),t=Date.now(),c=g.__lcaRetryConfig||{},m=c.maxRetries>0?c.maxRetries:200;if(t-s.t>2500)s.n=0;s.t=t;return++s.n<=m}}";
 const NATIVE_P3_FROM = "getSmokeTestRetryDelayMs(){return this.environmentService.smokeTestNalRetryDelayMs}";
+// P3 pins the request-layer retry delay to a flat 50ms (fast retry). This used to
+// surface rate-limit messages; instead of slowing retries with backoff, the DOM
+// helper now auto-hides those messages (per user choice), so we keep 50ms.
 const NATIVE_P3_TO = "getSmokeTestRetryDelayMs(){return 50}";
+// 0.7.3 briefly shipped an exponential-backoff P3; keep the literal so
+// applyNativePatch can replace it back with 50ms and removeNativePatch can revert
+// installs made by that build.
+const NATIVE_P3_TO_BACKOFF = "getSmokeTestRetryDelayMs(){var g=globalThis,n=(g.__lcaNR&&g.__lcaNR.n)||0;return n<=2?500:n<=8?1500:n<=20?4000:8000}";
 const NATIVE_P1_ORIG = /(\w+) instanceof (\w+)\|\|\1 instanceof (\w+)\|\|\1 instanceof (\w+)\?\{action:"throw",error:\1\}/;
 const NATIVE_P1_ORIG_G = /(\w+) instanceof (\w+)\|\|\1 instanceof (\w+)\|\|\1 instanceof (\w+)\?\{action:"throw",error:\1\}/g;
 const NATIVE_P1_PATCHED = /(\w+) instanceof (\w+)\|\|!(\w+)&&\1 instanceof (\w+)\|\|\1 instanceof (\w+)\?\{action:"throw",error:\1\}/;
@@ -1114,21 +1139,36 @@ function applyNativePatch(content) {
   }
   if (p2) {
     notes.push("P2 已是最新");
+  } else if (content.includes(NATIVE_P2_TO_LEGACY_INFINITE)) {
+    content = content.replace(NATIVE_P2_TO_LEGACY_INFINITE, NATIVE_P2_TO);
+    changed = true;
+    p2 = true;
+    notes.push("P2 已升级：无限重试 → 高容量断路器（5000次/波，防OOM）");
+  } else if (content.includes(NATIVE_P2_TO_BOUNDED)) {
+    content = content.replace(NATIVE_P2_TO_BOUNDED, NATIVE_P2_TO);
+    changed = true;
+    p2 = true;
+    notes.push("P2 已升级：有界(200) → 高容量断路器（5000次/波，防OOM）");
   } else if (content.includes(NATIVE_P2_FROM)) {
     content = content.replace(NATIVE_P2_FROM, NATIVE_P2_TO);
     changed = true;
     p2 = true;
-    notes.push("P2 已应用：强制无限重试");
+    notes.push("P2 已应用：高容量断路器（5000次/波，~4分钟后GC一次）");
   } else {
     notes.push("P2 未找到匹配");
   }
   if (p3) {
     notes.push("P3 已是最新");
+  } else if (content.includes(NATIVE_P3_TO_BACKOFF)) {
+    content = content.replace(NATIVE_P3_TO_BACKOFF, NATIVE_P3_TO);
+    changed = true;
+    p3 = true;
+    notes.push("P3 已改回：退避 → 50ms（错误改由 DOM 自动隐藏）");
   } else if (content.includes(NATIVE_P3_FROM)) {
     content = content.replace(NATIVE_P3_FROM, NATIVE_P3_TO);
     changed = true;
     p3 = true;
-    notes.push("P3 已应用：50ms 重试间隔");
+    notes.push("P3 已应用：50ms 快速重试");
   } else {
     notes.push("P3 未找到匹配");
   }
@@ -1141,8 +1181,20 @@ function removeNativePatch(content) {
     content = content.replace(NATIVE_P2_TO, NATIVE_P2_FROM);
     changed = true;
   }
+  if (content.includes(NATIVE_P2_TO_LEGACY_INFINITE)) {
+    content = content.replace(NATIVE_P2_TO_LEGACY_INFINITE, NATIVE_P2_FROM);
+    changed = true;
+  }
+  if (content.includes(NATIVE_P2_TO_BOUNDED)) {
+    content = content.replace(NATIVE_P2_TO_BOUNDED, NATIVE_P2_FROM);
+    changed = true;
+  }
   if (content.includes(NATIVE_P3_TO)) {
     content = content.replace(NATIVE_P3_TO, NATIVE_P3_FROM);
+    changed = true;
+  }
+  if (content.includes(NATIVE_P3_TO_BACKOFF)) {
+    content = content.replace(NATIVE_P3_TO_BACKOFF, NATIVE_P3_FROM);
     changed = true;
   }
   const next = content.replace(NATIVE_P1_PATCHED, '$1 instanceof $2||$1 instanceof $4||$1 instanceof $5?{action:"throw",error:$1}');
@@ -1168,8 +1220,19 @@ function stripLegacyInjections(content) {
 }
 
 function patchBlock(context) {
-  const helper = fs.readFileSync(getPaths(context).retryHelper, "utf8");
-  return `\n;${PATCH_START}\n${helper}\n${PATCH_END}\n`;
+  const paths = getPaths(context);
+  const helper = fs.readFileSync(paths.retryHelper, "utf8");
+  // Inject the user-configurable retry budget into the DOM helper. The helper
+  // reads window.__lcaRetryConfig.maxRetries to cap how many times one DOM failure
+  // wave is retried. The native P2 uses a fixed 5000-attempt circuit breaker
+  // (not configurable) to periodically release memory. autoHide keeps transient
+  // errors out of view.
+  let maxRetries = 200;
+  try { maxRetries = readSettings(paths).retryMaxRetries; } catch { /* keep default */ }
+  // autoHide keeps the rate-limit/paywall error UI out of view while the native
+  // 50ms retry runs in the background (per user request). Always on for now.
+  const config = `window.__lcaRetryConfig=${JSON.stringify({ maxRetries, autoHide: true })};`;
+  return `\n;${PATCH_START}\n${config}\n${helper}\n${PATCH_END}\n`;
 }
 
 function psSingleQuote(value) {
@@ -1239,6 +1302,12 @@ function installRetryPatch(context) {
   const original = fs.readFileSync(target, "utf8");
   const backup = `${target}.local-continue-backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const legacy = stripLegacyInjections(original);
+  // Apply the native patch: P1 (skip paywall throw) + P2 (high-capacity circuit
+  // breaker: 5000 retries/wave then one GC-friendly completion) + P3 (50ms). The
+  // 402/paywall auto-retry lives at the request layer. The DOM helper resets
+  // globalThis.__lcaNR to instantly restart each wave, and auto-hide keeps any
+  // transient errors out of view. The periodic completion prevents the OOM that
+  // a truly infinite retry caused in 0.7.0.
   const native = applyNativePatch(legacy.content);
   let content = native.content;
   if (content.includes(PATCH_START)) {
@@ -1252,11 +1321,12 @@ function installRetryPatch(context) {
   const write = writeWorkbench(target, content, backup);
   pruneWorkbenchBackups(target);
   retryPatchCache = { at: 0, value: null };
+  const nativeInfo = { p1: native.p1, p2: native.p2, p3: native.p3, notes: native.notes };
   if (context && context.globalState) {
     context.globalState.update(RETRY_WANTED_KEY, true);
-    context.globalState.update(RETRY_NATIVE_KEY, { p1: native.p1, p2: native.p2, p3: native.p3 });
+    context.globalState.update(RETRY_NATIVE_KEY, nativeInfo);
   }
-  return { target, backup, changed: true, elevated: write.elevated, legacyCleaned: legacy.changed, native: { p1: native.p1, p2: native.p2, p3: native.p3, notes: native.notes } };
+  return { target, backup, changed: true, elevated: write.elevated, legacyCleaned: legacy.changed, native: nativeInfo, nativeChanged: native.changed };
 }
 
 function uninstallRetryPatch(context) {
@@ -1856,7 +1926,7 @@ class PanelProvider {
       this.event("设置已保存。");
     } else if (message.type === "installRetryPatch") {
       const result = installRetryPatch(this.context);
-      const np = result.native ? `（Native Patch ${result.native.p1 ? "P1" : "·"}/${result.native.p2 ? "P2" : "·"}/${result.native.p3 ? "P3" : "·"}）` : "";
+      const np = result.nativeChanged ? "（已写入 native 断路器补丁：5000次/波自动重试+GC回收，错误自动隐藏）" : "";
       const elev = result.elevated ? "（已通过管理员提权写入）" : "";
       const cleaned = result.legacyCleaned ? "（已清理旧注入残留）" : "";
       this.event(`已注入图标 / 安装重试助手${np}${elev}${cleaned}，需完全退出并重启 Cursor（不是重载窗口）才会生效：${result.target}`);
@@ -2130,6 +2200,7 @@ class PanelProvider {
         <label class="setting-row"><span>图片最长边上限(px, 0=不压缩)</span><input id="setImageMaxDimension" type="number" min="0" step="100"></label>
         <label class="setting-row"><span>会话需关注时弹系统通知</span><input id="setNotifyOnAttention" type="checkbox"></label>
         <label class="setting-row"><span>保活时发送数学题/常识题</span><input id="setInteractiveKeepalive" type="checkbox"></label>
+        <label class="setting-row"><span>聊天框重试上限（每次失败最多重试次数）</span><input id="setRetryMaxRetries" type="number" min="1" max="1000"></label>
         <div class="modal-actions"><button class="mini-button" data-close-modal="settingsDialog">取消</button><button class="mini-button primary" id="saveSettings">保存</button></div>
       </div>
     </div>

@@ -5,8 +5,19 @@
   "use strict";
   if (window.__lcaRetryCleanup) window.__lcaRetryCleanup();
 
+  // The extension injects window.__lcaRetryConfig (see patchBlock) so the retry
+  // budget is user-configurable. The native P2 is a high-capacity circuit breaker
+  // (5000 retries/wave at 50ms, then one GC-friendly completion); this DOM helper
+  // is the outer layer that resets globalThis.__lcaNR to instantly restart each
+  // wave. maxRetries bounds the DOM helper's outer loop (how many native waves it
+  // will restart), not the native layer itself. autoHide keeps transient errors
+  // out of view, and purgeHiddenNodes caps DOM memory by removing old hidden
+  // error nodes beyond a 50-entry limit.
+  const __lcaCfg = (typeof window !== "undefined" && window.__lcaRetryConfig) || {};
+  const __lcaMaxRetries = Number(__lcaCfg.maxRetries);
+
   const CFG = {
-    MAX_RETRIES: 200,
+    MAX_RETRIES: __lcaMaxRetries > 0 ? __lcaMaxRetries : 200,
     CHECK_THROTTLE_MS: 300,
     POLL_MS: 1200,
     WARNING_GONE_WAIT_MS: 5000,
@@ -14,6 +25,19 @@
     SEND_BUTTON_WAIT_MS: 800,
     HIT_DECAY_MS: 3000,
   };
+
+  // Auto-hide the transient failure UI (the composer warning popup and the
+  // "Rate limit exceeded" / "You have an unpaid invoice" error bubbles) so the
+  // user never sees them while the retry runs in the background. Defaults on; the
+  // extension can disable it via window.__lcaRetryConfig.autoHide = false.
+  let autoHide = __lcaCfg.autoHide !== false;
+  // Phrases that identify the throwaway error bubbles we hide. Kept specific so we
+  // never hide a normal conversation message that merely mentions "rate limit".
+  const HIDE_PATTERNS = /you've reached the rate limit|reached the rate limit|rate limit exceeded|please wait a bit before trying again|you have an unpaid invoice|unpaid invoice/i;
+  // Nodes we hid directly (vs. via the stylesheet), so cleanup can restore them.
+  // Capped at 50 to avoid unbounded array growth during long retry sessions.
+  const HIDDEN_NODES_MAX = 50;
+  const hiddenNodes = [];
 
   let enabled = true;
   let mode = "IDLE"; // IDLE | HITTING | RETRYING | PAUSED
@@ -182,6 +206,12 @@
     if (!enabled || mode === "RETRYING") return;
     mode = "RETRYING";
     retryCount = 0;
+    // Reset the native (request-layer) circuit-breaker counter so the click below
+    // starts a FRESH native wave. The native P2 retries up to 5000 times then
+    // returns false once (letting the request complete and GC run); this DOM wave
+    // is the outer layer that instantly restarts it. Without the reset, an
+    // exhausted native counter would make the next request give up immediately.
+    try { globalThis.__lcaNR = { n: 0, t: Date.now() }; } catch (e) {}
     updateAllButtons();
     log("retry wave started");
 
@@ -223,6 +253,61 @@
     log("retry wave ended", retryCount, recovered ? "(recovered)" : "");
   }
 
+  // Inject (or remove) a stylesheet that visually collapses the composer warning
+  // popup. We hide it via CSS instead of removing the node so querySelector still
+  // finds it — the retry loop relies on the popup's presence/absence to know when
+  // a wave is in flight vs. recovered. Cursor still adds/removes the node itself,
+  // so success detection is unaffected.
+  function ensureHideStyle() {
+    let el = document.getElementById("lca-hide-style");
+    if (!autoHide) {
+      if (el) el.remove();
+      return;
+    }
+    if (el) return;
+    el = document.createElement("style");
+    el.id = "lca-hide-style";
+    el.textContent = ".composer-warning-popup{opacity:0!important;pointer-events:none!important;max-height:0!important;height:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;}";
+    (document.head || document.documentElement).appendChild(el);
+  }
+
+  // Hide the "Rate limit exceeded" / "unpaid invoice" error bubbles. These render
+  // as normal chat content (not the composer popup), so we match them by their
+  // very specific error text and hide the closest message bubble. The retry loop
+  // is what actually resends; this just keeps the throwaway error out of view.
+  // When the hiddenNodes array exceeds HIDDEN_NODES_MAX, the oldest entries are
+  // physically removed from the DOM (not just display:none) to reclaim memory.
+  function hideErrorBubbles() {
+    if (!autoHide) return;
+    const scope = q(".conversations") || q(".pane-body") || document.body;
+    if (!scope) return;
+    const candidates = scope.querySelectorAll('[data-message-index], [data-message-role], [class*="error"], [class*="Error"]');
+    candidates.forEach((el) => {
+      if (el.dataset && el.dataset.lcaHidden === "1") return;
+      const text = el.textContent || "";
+      if (text.length > 1200 || !HIDE_PATTERNS.test(text)) return;
+      const bubble = el.closest('[data-message-index]') || el.closest('[data-message-role]') || el;
+      if (bubble.dataset && bubble.dataset.lcaHidden === "1") return;
+      bubble.dataset.lcaHidden = "1";
+      bubble.style.setProperty("display", "none", "important");
+      hiddenNodes.push(bubble);
+      log("hid error bubble");
+    });
+    purgeHiddenNodes();
+  }
+
+  // Remove the oldest hidden nodes from the DOM entirely (not just display:none)
+  // when the tracking array exceeds the cap. This reclaims both DOM tree memory
+  // and the JS references we hold, preventing unbounded growth during long retry
+  // sessions. Nodes beyond the cap are already invisible, so removing them has no
+  // visual effect.
+  function purgeHiddenNodes() {
+    while (hiddenNodes.length > HIDDEN_NODES_MAX) {
+      const node = hiddenNodes.shift();
+      try { node.remove(); } catch (e) { /* already gone */ }
+    }
+  }
+
   function autoDismissRevertDialog() {
     const dialog = q(".pretty-dialog-modal");
     if (!dialog) return;
@@ -261,6 +346,8 @@
 
   function doChecks() {
     injectButtons();
+    ensureHideStyle();
+    hideErrorBubbles();
     if (enabled && mode !== "RETRYING" && q(".composer-warning-popup")) {
       retryWave();
     }
@@ -473,10 +560,11 @@
       return;
     }
     injectButtons();
+    ensureHideStyle();
     ensureObserver();
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollTick, CFG.POLL_MS);
-    console.log("[LCA Retry] ready");
+    console.log("[LCA Retry] ready (autoHide=" + autoHide + ")");
   }
 
   window.__lcaRetryMode = () => mode;
@@ -490,8 +578,24 @@
     recoverCount,
     lastRecoverRetries,
     maxRetries: CFG.MAX_RETRIES,
+    autoHide,
+    hidden: hiddenNodes.length,
     lastHitTime: lastHitTime ? new Date(lastHitTime).toLocaleString() : "",
   });
+  window.__lcaRetrySetAutoHide = (on) => {
+    autoHide = !!on;
+    ensureHideStyle();
+    if (autoHide) {
+      hideErrorBubbles();
+    } else {
+      // Restore everything we hid directly so the user can see past errors again.
+      while (hiddenNodes.length) {
+        const node = hiddenNodes.pop();
+        try { node.style.removeProperty("display"); if (node.dataset) delete node.dataset.lcaHidden; } catch (e) {}
+      }
+    }
+    console.log("[LCA Retry] autoHide=" + autoHide);
+  };
   window.__lcaRetryDebug = (on) => { DEBUG = !!on; console.log("[LCA Retry] DEBUG=" + DEBUG); };
   window.__lcaRetrySetEnabled = (on) => {
     enabled = !!on;
@@ -505,6 +609,12 @@
     if (checkTimer) { clearTimeout(checkTimer); checkTimer = null; }
     if (decayTimer) { clearTimeout(decayTimer); decayTimer = null; }
     document.querySelectorAll(".lca-retry-btn").forEach((element) => element.remove());
+    const hideStyle = document.getElementById("lca-hide-style");
+    if (hideStyle) hideStyle.remove();
+    while (hiddenNodes.length) {
+      const node = hiddenNodes.pop();
+      try { node.style.removeProperty("display"); if (node.dataset) delete node.dataset.lcaHidden; } catch (e) {}
+    }
     window.fetch = originalFetch;
     window.__lcaRetryCleanup = null;
   };
