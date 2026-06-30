@@ -17,7 +17,7 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const http = require("http");
-const { spawnSync } = require("child_process");
+const { spawnSync, spawn } = require("child_process");
 
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"]);
 const TEXT_EXTENSIONS = new Set([
@@ -90,6 +90,19 @@ function nowMs() {
 
 function isoNow() {
   return new Date().toISOString();
+}
+
+// Read the Cursor conversation identity that the agent terminal exposes via
+// environment variables (set by Cursor for agent-exec terminals). Used to
+// auto-fill the panel's per-session conversation id / workspace label so the
+// user never has to paste a request id by hand. All optional -- absent on a
+// plain user terminal, in which case the fields are simply empty.
+function captureAgentEnv() {
+  return {
+    conversation_id: process.env.CURSOR_CONVERSATION_ID || "",
+    workspace_label: process.env.CURSOR_WORKSPACE_LABEL || "",
+    cursor_agent: process.env.CURSOR_AGENT === "1",
+  };
 }
 
 function safeSessionId(value) {
@@ -395,6 +408,7 @@ class SessionState {
     this.historyPath = path.join(this.dir, "history.jsonl");
     this.queueLockDir = path.join(this.dir, ".queue.lock");
     this.waiterLockDir = path.join(this.dir, "waiter.lock");
+    this.presencePath = path.join(this.dir, "presence.json");
   }
 
   ensure() {
@@ -609,6 +623,8 @@ class SessionState {
       last_ack_id: status.last_ack_id || "",
       last_ack_at: status.last_ack_at || "",
       last_message_preview: status.last_message_preview || "",
+      conversation_id: status.conversation_id || "",
+      workspace_label: status.workspace_label || "",
       waiter: status.waiter || null,
     };
   }
@@ -846,6 +862,90 @@ async function bridgeRequest(port, secret, timeoutMs) {
   });
 }
 
+// --- Presence beacon ----------------------------------------------------------
+// During the agent's work between two `wait` calls no plugin process runs, so the
+// session has no heartbeat and the panel can't tell "working" from "interrupted".
+// The beacon fills that gap: a tiny detached process, launched transparently by
+// `wait`, that writes a presence heartbeat for the whole session lifetime and
+// self-terminates when the launching shell dies (terminal closed / conversation
+// interrupted). The panel then reads presence.json: fresh + no waiter == working;
+// stale == the terminal went away, i.e. interrupted -- detected within ~one
+// interval instead of a multi-minute time guess.
+const BEACON_INTERVAL_MS = 4000;
+const BEACON_STALE_MS = 12000;
+const BEACON_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000;
+
+function isProcessAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (error) {
+    // ESRCH -> gone; EPERM -> exists but not ours to signal (still alive).
+    return Boolean(error) && error.code === "EPERM";
+  }
+}
+
+function spawnBeaconIfNeeded(project, session) {
+  try {
+    const existing = session.readJson(session.presencePath, null);
+    if (existing && Number(existing.heartbeat_ms || 0)
+        && (nowMs() - Number(existing.heartbeat_ms)) <= BEACON_STALE_MS
+        && isProcessAlive(existing.pid)) {
+      return; // a live beacon already covers this session
+    }
+    const script = process.argv[1];
+    if (!script) return;
+    const child = spawn(process.execPath, [
+      script, "beacon",
+      "--state-dir", project.stateDir,
+      "--session-id", session.sessionId,
+      "--watch-ppid", String(process.ppid || 0),
+      "--interval", String(Math.round(BEACON_INTERVAL_MS / 1000)),
+    ], { detached: true, stdio: "ignore", windowsHide: true });
+    child.unref();
+  } catch {
+    // Best effort: without a beacon the panel just falls back to the time threshold.
+  }
+}
+
+async function runBeacon(project, sessionId, watchPpid, intervalMs) {
+  const session = project.session(sessionId);
+  // Dedupe: stand aside if a fresh beacon from another process already covers this
+  // session, so beacons never pile up across wait cycles.
+  const existing = session.readJson(session.presencePath, null);
+  if (existing && existing.pid !== process.pid && Number(existing.heartbeat_ms || 0)
+      && (nowMs() - Number(existing.heartbeat_ms)) <= BEACON_STALE_MS
+      && isProcessAlive(existing.pid)) {
+    return 0;
+  }
+  let stop = false;
+  const onSignal = () => { stop = true; };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const interval = Math.max(1000, Number(intervalMs) || BEACON_INTERVAL_MS);
+  const startedMs = nowMs();
+  const ppid = Number(watchPpid) || 0;
+  while (!stop) {
+    // The launching shell vanishing (terminal closed / conversation interrupted)
+    // is the cue to exit, so presence.json goes stale within ~one interval.
+    if (ppid > 0 && !isProcessAlive(ppid)) break;
+    if (nowMs() - startedMs > BEACON_MAX_LIFETIME_MS) break;
+    session.writeJsonBestEffort(session.presencePath, {
+      beacon: true,
+      pid: process.pid,
+      watch_ppid: ppid,
+      heartbeat_ms: nowMs(),
+      heartbeat_at: isoNow(),
+      interval_ms: interval,
+    });
+    await sleep(interval);
+  }
+  return 0;
+}
+
 async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report = null, reportStatus = "done", interactiveKeepalive = false, bridgeConfig = null) {
   sessionId = safeSessionId(sessionId);
   project.registerSession(sessionId);
@@ -864,22 +964,57 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
   const keepaliveDeadline = keepaliveSeconds <= 0 ? null : Date.now() + keepaliveSeconds * 1000;
   const offlineAfter = Number(project.settings().offlineAfterSeconds || 15);
   const heartbeatInterval = Math.max(1.0, Math.min(5.0, offlineAfter / 3.0, LOCK_STALE_MS / 3000.0)) * 1000;
-  session.writeStatus(runId, "waiting", { started_at: isoNow(), last_ack_id: null, keepalive_deadline_ms: keepaliveDeadline });
+  // Auto-capture the Cursor conversation identity from the agent terminal's
+  // environment. Cursor sets CURSOR_CONVERSATION_ID (and friends) for its
+  // agent-exec terminals, so the panel can show / reference the exact chat with
+  // zero manual entry and without reading Cursor's private SQLite store. Written
+  // once here; writeStatus reuses _lastStatus as its base, so it persists across
+  // every later heartbeat write.
+  const agentEnv = captureAgentEnv();
+  session.writeStatus(runId, "waiting", {
+    started_at: isoNow(),
+    last_ack_id: null,
+    keepalive_deadline_ms: keepaliveDeadline,
+    conversation_id: agentEnv.conversation_id,
+    workspace_label: agentEnv.workspace_label,
+    cursor_agent: agentEnv.cursor_agent,
+  });
+  // Launch (once per session) the detached presence beacon so the panel can see
+  // real "working vs interrupted" state during the agent's work between waits.
+  spawnBeaconIfNeeded(project, session);
   process.stdout.write(`[续聊助手] 会话 ${sessionId} 已进入等待状态，正在轮询队列…\n`);
   let lastHeartbeat = Date.now();
   let spinnerActive = false;
   let lastSpinnerBeat = Date.now();
   let spinnerIdx = 0;
   const spinnerChars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  // Adaptive heartbeat. A real terminal (TTY) gets the per-second \r spinner so a
+  // human watching sees a live animation. But when stdout is a pipe -- which is
+  // how the Cursor Shell tool captures the agent's command -- \r and ANSI escapes
+  // are NOT folded onto one line: they pile up at ~1 line/sec (≈300 lines per
+  // 300s keepalive cycle) and the clear sequence leaks a literal "[K" right before
+  // the result. So when not a TTY we emit a plain newline heartbeat far less
+  // often: still enough output to prove the process is alive (the Shell tool never
+  // flags a hang), but ~10x less captured noise for the agent to read past.
+  const isTty = Boolean(process.stdout.isTTY);
+  const spinnerIntervalMs = isTty ? 1000 : 10000;
   function clearSpinner() {
-    if (spinnerActive) { process.stdout.write("\r\x1b[K"); spinnerActive = false; }
+    // Only the TTY spinner leaves an unterminated line to wipe; the piped
+    // heartbeat already ends each line with \n, so there is nothing to clear
+    // (and we must not emit ANSI there, or it leaks as a literal "[K").
+    if (spinnerActive && isTty) { process.stdout.write("\r\x1b[K"); }
+    spinnerActive = false;
   }
   function writeSpinner() {
     const elapsed = Math.floor((Date.now() - startedAtMs) / 1000);
-    const ch = spinnerChars[spinnerIdx % spinnerChars.length];
-    spinnerIdx++;
-    process.stdout.write(`\r${ch} [续聊助手] 等待中… ${elapsed}s`);
-    spinnerActive = true;
+    if (isTty) {
+      const ch = spinnerChars[spinnerIdx % spinnerChars.length];
+      spinnerIdx++;
+      process.stdout.write(`\r${ch} [续聊助手] 等待中… ${elapsed}s`);
+      spinnerActive = true;
+    } else {
+      process.stdout.write(`[续聊助手] 等待中… ${elapsed}s\n`);
+    }
   }
   let lastSessionSig = "init";
   let lastGlobalSig = "init";
@@ -902,7 +1037,7 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
   try {
     for (;;) {
       const now = Date.now();
-      if (now - lastSpinnerBeat >= 1000) {
+      if (now - lastSpinnerBeat >= spinnerIntervalMs) {
         writeSpinner();
         lastSpinnerBeat = now;
       }
@@ -976,7 +1111,13 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
       // endpoint for an instruction. This runs alongside the file-queue polling,
       // so both mechanisms can coexist during a gradual migration.
       if (bridgeConfig && bridgeConfig.port && bridgeConfig.secret) {
-        const bridgeTimeout = Math.min(30000, keepaliveDeadline ? Math.max(1000, keepaliveDeadline - Date.now()) : 30000);
+        // Cap the bridge long-poll well below the old 30s. The await below parks
+        // the loop on the bridge socket, so anything that lands in the *file*
+        // queue meanwhile isn't seen until it returns. A 5s ceiling keeps both
+        // channels responsive (file-queue latency ≤5s in bridge mode instead of
+        // 30s) for the price of a few extra cheap localhost round-trips, and it
+        // still shortens further as the keepalive deadline approaches.
+        const bridgeTimeout = Math.min(5000, keepaliveDeadline ? Math.max(1000, keepaliveDeadline - Date.now()) : 5000);
         const bridgeResult = await bridgeRequest(bridgeConfig.port, bridgeConfig.secret, bridgeTimeout);
         if (bridgeResult && bridgeResult.instruction && bridgeResult.action !== "WAIT") {
           const bridgeItem = {
@@ -1210,6 +1351,11 @@ async function main() {
     );
   }
 
+  if (command === "beacon") {
+    const toIntB = (value, fallback) => { const n = parseInt(value, 10); return Number.isFinite(n) ? n : fallback; };
+    return runBeacon(project, args["session-id"] || "agent-1", toIntB(args["watch-ppid"], 0), toIntB(args.interval, 4) * 1000);
+  }
+
   if (command === "send") {
     const payload = args.payload ? JSON.parse(args.payload) : normalizePayload(args.text || "");
     const item = args["global-queue"]
@@ -1245,17 +1391,40 @@ async function main() {
     return 0;
   }
 
-  console.error("usage: node instruction.js <wait|send|status|clear|doctor> [--state-dir DIR] [--session-id ID] ...");
+  console.error("usage: node instruction.js <wait|send|status|clear|doctor|beacon> [--state-dir DIR] [--session-id ID] ...");
   return 1;
 }
 
-main()
-  .then((code) => {
-    // Set exitCode instead of process.exit() so a buffered stdout write (the
-    // rendered instruction can be large on a pipe) fully drains before exit.
-    process.exitCode = code || 0;
-  })
-  .catch((error) => {
-    console.error(`error: ${error && error.message ? error.message : error}`);
-    process.exitCode = 1;
-  });
+// Export the reusable pieces so other runtimes (e.g. the MCP server) can drive
+// the very same on-disk queue/session/state machine instead of duplicating it.
+// Only auto-run the CLI when executed directly, never when `require`d.
+module.exports = {
+  ProjectState,
+  SessionState,
+  renderPayload,
+  normalizePayload,
+  makeQueueItem,
+  safeSessionId,
+  queueSignature,
+  createQueueNotifier,
+  captureAgentEnv,
+  isProcessAlive,
+  spawnBeaconIfNeeded,
+  nowMs,
+  isoNow,
+  keepaliveMessage,
+  generateKeepaliveInstruction,
+};
+
+if (require.main === module) {
+  main()
+    .then((code) => {
+      // Set exitCode instead of process.exit() so a buffered stdout write (the
+      // rendered instruction can be large on a pipe) fully drains before exit.
+      process.exitCode = code || 0;
+    })
+    .catch((error) => {
+      console.error(`error: ${error && error.message ? error.message : error}`);
+      process.exitCode = 1;
+    });
+}

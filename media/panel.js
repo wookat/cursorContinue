@@ -97,9 +97,26 @@
     return state.sessions.find((session) => session.id === state.selectedSessionId) || state.sessions[0] || null;
   }
 
+  function formatDuration(ms) {
+    const s = Math.max(0, Math.round(Number(ms || 0) / 1000));
+    if (s < 60) return `${s}秒`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}分${s % 60 ? `${s % 60}秒` : ""}`;
+    const h = Math.floor(m / 60);
+    return `${h}小时${m % 60 ? `${m % 60}分` : ""}`;
+  }
+
   function sessionStateLabel(session) {
-    if (session.connected) {
-      if (session.queueLength > 0) return "已连接，待消费";
+    // activity is derived live by the extension from status + elapsed time, so it
+    // reflects "working"/"stalled" even while the waiter process is not running.
+    if (session.activity === "working") return `执行中 · 已 ${formatDuration(session.workingAgeMs)}`;
+    if (session.activity === "stalled") {
+      return session.interruptReason === "terminal"
+        ? "已中断 · 终端/对话已关闭"
+        : `可能中断 · ${formatDuration(session.workingAgeMs)} 未返回 wait`;
+    }
+    if (session.activity === "queued" || (session.connected && session.queueLength > 0)) return "已连接，待消费";
+    if (session.activity === "idle" || session.connected) {
       if (session.keepaliveDeadlineMs) {
         const remain = Math.round((session.keepaliveDeadlineMs - Date.now()) / 1000);
         if (remain > 0) return `已连接，空闲 · 保活 ${remain}s`;
@@ -115,6 +132,8 @@
   }
 
   function sessionDotClass(session) {
+    if (session.activity === "working") return "session-dot working";
+    if (session.activity === "stalled") return "session-dot stalled";
     if (session.connected) return "session-dot online";
     if (session.state === "received" || session.state === "keepalive") return "session-dot pending";
     return "session-dot offline";
@@ -194,6 +213,10 @@
       s.lastResultAtMs || 0,
       s.connected && s.keepaliveDeadlineMs ? Math.floor(s.keepaliveDeadlineMs / 1000) : 0,
       s.overrides ? `${s.overrides.keepaliveSeconds || ""}|${s.overrides.waitTimeoutSeconds || ""}|${s.overrides.pollSeconds || ""}` : "",
+      s.conversationShort || "",
+      s.activity || "",
+      s.interruptReason || "",
+      (s.activity === "working" || s.activity === "stalled") ? Math.floor((s.workingAgeMs || 0) / 3000) : 0,
       (s.queuedResponses || []).map((e) => e.id).join(","),
     ].join("\u0001")).join("\u0002");
     const global = (state.globalQueue || []).map((e) => e.id).join(",");
@@ -247,15 +270,25 @@
       session.queueLength || 0, session.lastResultStatus || "", session.lastResultAtMs || 0,
       session.id === state.selectedSessionId ? 1 : 0,
       session.overrides ? 1 : 0,
+      session.conversationShort || "",
+      session.activity || "",
+      session.interruptReason || "",
+      (session.activity === "working" || session.activity === "stalled") ? Math.floor((session.workingAgeMs || 0) / 3000) : 0,
     ].join("\u0001");
     const cached = _sessionCardCache.get(session.id);
     if (cached && cached.sig === sig) return cached.html;
+    // The conversation id is auto-captured by the waiter from the agent terminal's
+    // CURSOR_CONVERSATION_ID; show a short, copy-on-click chip so the user can
+    // grab the exact Cursor chat id without ever typing it.
+    const cidChip = session.conversationShort
+      ? `<span class="session-cid" role="button" tabindex="0" data-copy-cid="${escapeHtml(session.conversationId)}" title="Cursor 会话 ID：${escapeHtml(session.conversationId)}（点击复制）">🔗 ${escapeHtml(session.conversationShort)}</span>`
+      : "";
     const html = `
       <button class="session-card ${session.id === state.selectedSessionId ? "selected" : ""}${attentionClass(session)}" data-session-id="${escapeHtml(session.id)}">
         <span class="${sessionDotClass(session)}"></span>
         <span class="session-main">
-          <span class="session-name">${escapeHtml(session.name || session.id)}${session.overrides ? ' <span class="session-override" title="使用自定义参数">⚙</span>' : ""}</span>
-          <span class="session-meta">${escapeHtml(sessionStateLabel(session))}</span>
+          <span class="session-name">${escapeHtml(session.name || session.id)}${session.overrides ? ' <span class="session-override" title="使用自定义参数">⚙</span>' : ""}${cidChip}</span>
+          <span class="session-meta ${session.activity === "working" ? "meta-working" : session.activity === "stalled" ? "meta-stalled" : ""}">${escapeHtml(sessionStateLabel(session))}</span>
           ${resultBadge(session)}
         </span>
         <span class="session-queue">队列 ${session.queueLength || 0}</span>
@@ -272,6 +305,7 @@
     $("setGlobalQueueLimit").value = state.settings.globalQueueLimit ?? 20;
     $("setKeepalive").value = state.settings.keepaliveSeconds ?? 300;
     $("setOfflineAfter").value = state.settings.offlineAfterSeconds ?? 15;
+    $("setWorkingTimeout").value = state.settings.workingTimeoutSeconds ?? 300;
     $("setTimeout").value = state.settings.waitTimeoutSeconds ?? 0;
     $("setPoll").value = state.settings.pollSeconds ?? 0.2;
     $("setHistoryLimit").value = state.settings.historyLimit ?? 200;
@@ -481,6 +515,7 @@
         globalQueueLimit: Number($("setGlobalQueueLimit").value || 20),
         keepaliveSeconds: Number($("setKeepalive").value || 300),
         offlineAfterSeconds: Number($("setOfflineAfter").value || 15),
+        workingTimeoutSeconds: Number($("setWorkingTimeout").value || 300),
         waitTimeoutSeconds: Number($("setTimeout").value || 0),
         pollSeconds: Number($("setPoll").value || 0.2),
         historyLimit: Number($("setHistoryLimit").value || 200),
@@ -521,6 +556,72 @@
     closeModal("sessionSettingsDialog");
   }
 
+  function handoffOptionLabel(session) {
+    const cid = session.conversationShort ? ` 🔗${session.conversationShort}` : "";
+    return `${session.name || session.id} · ${session.connected ? "在线" : "离线"}${cid}`;
+  }
+
+  function handoffOption(value, label, selected) {
+    return `<option value="${escapeHtml(value)}"${selected ? " selected" : ""}>${escapeHtml(label)}</option>`;
+  }
+
+  function handoffContextFor(session) {
+    if (!session) return "";
+    const parts = [];
+    if (session.lastMessagePreview) parts.push(`[原会话最近指令] ${session.lastMessagePreview}`);
+    if (session.lastResult) parts.push(`[原会话最近结果] ${session.lastResult}`);
+    return parts.join("\n");
+  }
+
+  function openHandoff() {
+    const sessions = state.sessions || [];
+    const sourceId = state.selectedSessionId || (sessions[0] && sessions[0].id) || "";
+    $("handoffSource").innerHTML = sessions.map((s) => handoffOption(s.id, handoffOptionLabel(s), s.id === sourceId)).join("");
+    // Prefer connected sessions as targets; fall back to any other session so the
+    // handoff still queues if nothing is online yet.
+    const online = sessions.filter((s) => s.connected && s.id !== sourceId);
+    const pool = online.length ? online : sessions.filter((s) => s.id !== sourceId);
+    $("handoffTarget").innerHTML = pool.length
+      ? pool.map((s, i) => handoffOption(s.id, handoffOptionLabel(s), i === 0)).join("")
+      : '<option value="">（暂无其它会话）</option>';
+    $("handoffReason").value = "";
+    prefillHandoffContext();
+    openModal("handoffDialog");
+  }
+
+  function prefillHandoffContext() {
+    const sid = $("handoffSource").value;
+    const session = (state.sessions || []).find((s) => s.id === sid);
+    $("handoffContext").value = handoffContextFor(session);
+    updateHandoffHint();
+  }
+
+  function updateHandoffHint() {
+    const sid = $("handoffSource").value;
+    const tid = $("handoffTarget").value;
+    const hint = $("handoffHint");
+    if (!hint) return;
+    if (!tid) { hint.textContent = "没有可用的目标会话，请先新建或连接另一个会话。"; return; }
+    if (sid === tid) { hint.textContent = "来源会话和目标会话不能相同。"; return; }
+    const target = (state.sessions || []).find((s) => s.id === tid);
+    hint.textContent = target && !target.connected
+      ? "提示：目标会话当前离线，转接消息会先排队，等它进入 wait 后被消费。"
+      : "目标会话在线，转接后会尽快被消费。";
+  }
+
+  function submitHandoff() {
+    const sourceId = $("handoffSource").value;
+    const targetId = $("handoffTarget").value;
+    if (!targetId || sourceId === targetId) { updateHandoffHint(); return; }
+    send("handoffSession", {
+      sourceId,
+      targetId,
+      reason: $("handoffReason").value,
+      context: $("handoffContext").value,
+    });
+    closeModal("handoffDialog");
+  }
+
   function renderBridgeStatus() {
     const el = $("bridgeStatus");
     if (!el) return;
@@ -541,10 +642,18 @@
     $("installRule").addEventListener("click", () => send("installRule"));
     $("startWait").addEventListener("click", () => send("startWait", { sessionId: state.selectedSessionId }));
     $("runDoctor").addEventListener("click", () => send("startDoctor"));
+    const installMcpBtn = $("installMcpBtn");
+    if (installMcpBtn) installMcpBtn.addEventListener("click", () => send("installMcp"));
+    const copyMcpBtn = $("copyMcpInstructionBtn");
+    if (copyMcpBtn) copyMcpBtn.addEventListener("click", () => send("copyMcpInstruction", { sessionId: state.selectedSessionId }));
     $("renameSession").addEventListener("click", () => send("renameSessionPrompt", { sessionId: state.selectedSessionId }));
     $("sessionSettingsBtn").addEventListener("click", openSessionSettings);
     $("saveSessionSettings").addEventListener("click", saveSessionSettings);
     $("clearSessionSettings").addEventListener("click", clearSessionSettings);
+    $("handoffBtn").addEventListener("click", openHandoff);
+    $("doHandoff").addEventListener("click", submitHandoff);
+    $("handoffSource").addEventListener("change", prefillHandoffContext);
+    $("handoffTarget").addEventListener("change", updateHandoffHint);
     $("deleteCurrentSession").addEventListener("click", () => send("deleteSession", { sessionId: state.selectedSessionId }));
     $("stopLoop").addEventListener("click", () => send("stop", { sessionId: state.selectedSessionId }));
     $("clearSelectedQueue").addEventListener("click", () => send("clearQueue", { scope: "session", sessionId: state.selectedSessionId }));
@@ -560,6 +669,15 @@
     $("pickEditor").addEventListener("click", () => send("pickActiveEditor"));
     $("pickWorkspace").addEventListener("click", () => send("pickWorkspaceFolder"));
     $("sessionList").addEventListener("click", (event) => {
+      // A click on the conversation-id chip copies the id (via the extension's
+      // clipboard) instead of selecting the card -- one-tap, no manual typing.
+      const cidEl = event.target && event.target.closest ? event.target.closest("[data-copy-cid]") : null;
+      if (cidEl) {
+        event.stopPropagation();
+        const cid = cidEl.dataset.copyCid || "";
+        if (cid) send("copyText", { text: cid });
+        return;
+      }
       const card = event.target && event.target.closest ? event.target.closest("[data-session-id]") : null;
       if (!card) return;
       state.selectedSessionId = card.dataset.sessionId;

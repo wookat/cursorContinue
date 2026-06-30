@@ -4,6 +4,7 @@ import os
 import platform
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -381,6 +382,7 @@ class SessionState:
         self.history_path = self.dir / "history.jsonl"
         self.queue_lock_dir = self.dir / ".queue.lock"
         self.waiter_lock_dir = self.dir / "waiter.lock"
+        self.presence_path = self.dir / "presence.json"
 
     def ensure(self):
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -571,6 +573,8 @@ class SessionState:
             "last_ack_id": status.get("last_ack_id") or "",
             "last_ack_at": status.get("last_ack_at") or "",
             "last_message_preview": status.get("last_message_preview") or "",
+            "conversation_id": status.get("conversation_id") or "",
+            "workspace_label": status.get("workspace_label") or "",
             "waiter": status.get("waiter"),
         }
 
@@ -756,6 +760,114 @@ def build_rerun_cmd(project, session_id, timeout_seconds, keepalive_seconds, pol
     return " ".join(parts)
 
 
+# --- Presence beacon ----------------------------------------------------------
+# A tiny detached process the waiter launches transparently. It heartbeats a
+# presence file for the whole session lifetime and self-terminates when the
+# launching shell dies (terminal closed / conversation interrupted), so the panel
+# can tell "working" (beacon alive, no waiter) from "interrupted" (beacon gone)
+# in seconds instead of guessing from a time threshold.
+BEACON_INTERVAL_MS = 4000
+BEACON_STALE_MS = 12000
+BEACON_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000
+
+
+def _pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def spawn_beacon_if_needed(project, session):
+    try:
+        existing = session.read_json(session.presence_path, None)
+        if existing and int(existing.get("heartbeat_ms", 0) or 0) \
+                and (now_ms() - int(existing.get("heartbeat_ms", 0))) <= BEACON_STALE_MS \
+                and _pid_alive(existing.get("pid")):
+            return
+        script = sys.argv[0] if sys.argv else ""
+        if not script:
+            return
+        cmd = [sys.executable, script, "beacon",
+               "--state-dir", str(project.state_dir),
+               "--session-id", session.session_id,
+               "--watch-ppid", str(os.getppid() or 0),
+               "--interval", str(BEACON_INTERVAL_MS // 1000)]
+        kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL, close_fds=True)
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED|NEW_GROUP|NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)
+    except Exception:  # noqa: BLE001 - best effort; panel falls back to time threshold
+        pass
+
+
+def run_beacon(project, session_id, watch_ppid, interval_ms):
+    session = project.session(session_id)
+    existing = session.read_json(session.presence_path, None)
+    if existing and existing.get("pid") != os.getpid() and int(existing.get("heartbeat_ms", 0) or 0) \
+            and (now_ms() - int(existing.get("heartbeat_ms", 0))) <= BEACON_STALE_MS \
+            and _pid_alive(existing.get("pid")):
+        return 0
+    stop = {"v": False}
+
+    def _on_signal(_signum, _frame):
+        stop["v"] = True
+
+    for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if _sig is not None:
+            try:
+                signal.signal(_sig, _on_signal)
+            except Exception:  # noqa: BLE001 - some platforms restrict signal handlers
+                pass
+    interval = max(1.0, (interval_ms or BEACON_INTERVAL_MS) / 1000.0)
+    started = time.time()
+    ppid = int(watch_ppid or 0)
+    while not stop["v"]:
+        if ppid > 0 and not _pid_alive(ppid):
+            break
+        if (time.time() - started) * 1000 > BEACON_MAX_LIFETIME_MS:
+            break
+        session.write_json_best_effort(session.presence_path, {
+            "beacon": True,
+            "pid": os.getpid(),
+            "watch_ppid": ppid,
+            "heartbeat_ms": now_ms(),
+            "heartbeat_at": iso_now(),
+            "interval_ms": int(interval * 1000),
+        })
+        time.sleep(interval)
+    return 0
+
+
 def wait_for_instruction(project, session_id, timeout_seconds, keepalive_seconds, poll_seconds,
                          report=None, report_status="done", interactive_keepalive=False, bridge_config=None):
     session_id = safe_session_id(session_id)
@@ -780,27 +892,57 @@ def wait_for_instruction(project, session_id, timeout_seconds, keepalive_seconds
     # low instruction latency.
     offline_after = float(project.settings().get("offlineAfterSeconds", 15) or 15)
     heartbeat_interval = max(1.0, min(5.0, offline_after / 3.0, LOCK_STALE_MS / 3000.0))
-    session.write_status(run_id, "waiting", started_at=iso_now(), last_ack_id=None)
+    # Auto-capture the Cursor conversation identity from the agent terminal's
+    # environment (Cursor sets these for its agent-exec terminals), so the panel
+    # can show / reference the exact chat with zero manual entry and without
+    # touching Cursor's private SQLite store. write_status re-reads + merges the
+    # file each call, so writing it once here keeps it present in later writes.
+    agent_env = {
+        "conversation_id": os.environ.get("CURSOR_CONVERSATION_ID", ""),
+        "workspace_label": os.environ.get("CURSOR_WORKSPACE_LABEL", ""),
+        "cursor_agent": os.environ.get("CURSOR_AGENT") == "1",
+    }
+    session.write_status(run_id, "waiting", started_at=iso_now(), last_ack_id=None, **agent_env)
+    # Launch (once per session) the detached presence beacon so the panel sees
+    # real working-vs-interrupted state during the agent's work between waits.
+    spawn_beacon_if_needed(project, session)
     print(f"[续聊助手] 会话 {session_id} 已进入等待状态，正在轮询队列…", flush=True)
     last_heartbeat = time.time()
     spinner_active = [False]
     last_spinner_beat = time.time()
     spinner_idx = [0]
     spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    # Adaptive heartbeat. A real terminal (TTY) gets the per-second \r spinner so a
+    # human watching sees a live animation. But when stdout is a pipe -- how the
+    # Cursor Shell tool captures the agent's command -- \r and ANSI escapes are NOT
+    # folded onto one line: they pile up at ~1 line/sec (≈300 lines per 300s
+    # keepalive cycle) and the clear sequence leaks a literal "[K" before the
+    # result. So when not a TTY we emit a plain newline heartbeat far less often:
+    # still enough output to prove the process is alive (the Shell tool never flags
+    # a hang), but ~10x less captured noise for the agent to read past.
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    spinner_interval = 1.0 if is_tty else 10.0
 
     def clear_spinner():
-        if spinner_active[0]:
+        # Only the TTY spinner leaves an unterminated line to wipe; the piped
+        # heartbeat already ends each line with \n, so there is nothing to clear
+        # (and we must not emit ANSI there, or it leaks as a literal "[K").
+        if spinner_active[0] and is_tty:
             sys.stdout.write("\r\x1b[K")
             sys.stdout.flush()
-            spinner_active[0] = False
+        spinner_active[0] = False
 
     def write_spinner():
         elapsed = int((now_ms() - started_at_ms) / 1000)
-        ch = spinner_chars[spinner_idx[0] % len(spinner_chars)]
-        spinner_idx[0] += 1
-        sys.stdout.write(f"\r{ch} [续聊助手] 等待中… {elapsed}s")
-        sys.stdout.flush()
-        spinner_active[0] = True
+        if is_tty:
+            ch = spinner_chars[spinner_idx[0] % len(spinner_chars)]
+            spinner_idx[0] += 1
+            sys.stdout.write(f"\r{ch} [续聊助手] 等待中… {elapsed}s")
+            sys.stdout.flush()
+            spinner_active[0] = True
+        else:
+            sys.stdout.write(f"[续聊助手] 等待中… {elapsed}s\n")
+            sys.stdout.flush()
     last_session_sig = "init"
     last_global_sig = "init"
     # P-3 adaptive poll: poll the queue at the fast base interval while there is
@@ -817,7 +959,7 @@ def wait_for_instruction(project, session_id, timeout_seconds, keepalive_seconds
     try:
         while True:
             now = time.time()
-            if now - last_spinner_beat >= 1.0:
+            if now - last_spinner_beat >= spinner_interval:
                 write_spinner()
                 last_spinner_beat = now
             if now - last_heartbeat >= heartbeat_interval:
@@ -1129,6 +1271,12 @@ def main():
     doctor_parser.add_argument("--session-id", default=None)
     doctor_parser.add_argument("--json", action="store_true", help="Emit the raw report as JSON")
 
+    beacon_parser = subparsers.add_parser("beacon", help="Run a presence beacon for one session")
+    beacon_parser.add_argument("--state-dir", default=str(default_state))
+    beacon_parser.add_argument("--session-id", default="agent-1")
+    beacon_parser.add_argument("--watch-ppid", type=int, default=0)
+    beacon_parser.add_argument("--interval", type=int, default=4)
+
     parser.add_argument("--state-dir", default=str(default_state), help=argparse.SUPPRESS)
     parser.add_argument("--send", help=argparse.SUPPRESS)
     parser.add_argument("--send-file", help=argparse.SUPPRESS)
@@ -1149,6 +1297,9 @@ def main():
         return wait_for_instruction(project, args.session_id, args.timeout, args.keepalive, args.poll,
                                     args.report, args.report_status,
                                     args.interactive_keepalive, bridge_config)
+    if args.command == "beacon":
+        project = ProjectState(args.state_dir)
+        return run_beacon(project, args.session_id, args.watch_ppid, args.interval * 1000)
     if args.command == "send":
         project = ProjectState(args.state_dir)
         payload = json.loads(args.payload) if args.payload else normalize_payload(args.text or "")

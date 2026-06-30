@@ -1237,13 +1237,33 @@ select:disabled {
   animation: dot-pulse 2s ease-in-out infinite;
 }
 
+.session-dot.working {
+  background: var(--accent);
+  animation: dot-pulse 1.3s ease-in-out infinite;
+}
+
+.session-dot.stalled {
+  background: var(--danger);
+  animation: dot-pulse 1.3s ease-in-out infinite;
+}
+
+.session-meta.meta-working {
+  color: color-mix(in srgb, var(--accent) 78%, var(--text));
+}
+
+.session-meta.meta-stalled {
+  color: color-mix(in srgb, var(--danger) 82%, var(--text));
+}
+
 @keyframes dot-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .session-dot.online { animation: none; }
+  .session-dot.online,
+  .session-dot.working,
+  .session-dot.stalled { animation: none; }
 }
 
 .session-main {
@@ -1279,6 +1299,28 @@ select:disabled {
   white-space: nowrap;
 }
 
+.session-cid {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: color-mix(in srgb, var(--accent) 70%, var(--text));
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  vertical-align: middle;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.session-cid:hover {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
 .target-row {
   display: flex;
   align-items: center;
@@ -1307,6 +1349,26 @@ select:disabled {
 
 .slim-status .meta-hint {
   max-height: 40px;
+}
+
+.handoff-context-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.handoff-context-row textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 92px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--border));
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .advanced-dialog {

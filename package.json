@@ -2,7 +2,7 @@
   "name": "local-continue-assistant",
   "displayName": "续聊助手",
   "description": "Cursor 续聊助手：队列、握手、状态反馈、附件输入、图片粘贴和官方聊天框重试助手。",
-  "version": "0.7.6",
+  "version": "0.8.0",
   "publisher": "local-codex",
   "license": "MIT",
   "engines": {
@@ -109,6 +109,7 @@
     "media/official-retry-helper.js",
     "runtime/instruction.py",
     "runtime/instruction.js",
+    "runtime/mcp-server.js",
     "runtime/cutc_rules_template.mdc"
   ]
 }
