@@ -17,141 +17,23 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawnSync, spawn } = require("child_process");
 
-const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"]);
-const TEXT_EXTENSIONS = new Set([
-  ".txt", ".py", ".js", ".ts", ".tsx", ".jsx", ".md", ".html", ".css",
-  ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".ps1", ".sh", ".bat",
-  ".c", ".cpp", ".h", ".hpp", ".cs", ".java", ".go", ".rs", ".php", ".rb",
-]);
-
-const LOCK_STALE_MS = 15000;
-const LOCK_WAIT_SECONDS = 5;
-const DEFAULT_SETTINGS = {
-  waitTimeoutSeconds: 0,
-  keepaliveSeconds: 300,
-  offlineAfterSeconds: 15,
-  maxConcurrentSessions: 4,
-  schedulingMode: "direct",
-  perSessionQueueLimit: 3,
-  globalQueueLimit: 20,
-  pollSeconds: 0.2,
-  historyLimit: 200,
-  imageLimit: 50,
-  imageMaxDimension: 2000,
-  notifyOnAttention: true,
-};
-
-// Windows holds files open briefly (other waiter, panel reader, AV, indexer),
-// making an atomic rename/read fail transiently. Retry with jittered backoff
-// instead of crashing -- this is what keeps multi-session stable.
-const RENAME_RETRY_ATTEMPTS = 24;
-const RENAME_RETRY_BASE_DELAY = 15;
-const RENAME_RETRY_MAX_DELAY = 300;
-const BEST_EFFORT_ATTEMPTS = 6;
-const READ_RETRY_ATTEMPTS = 6;
-const TRANSIENT_FS_CODES = new Set(["EPERM", "EACCES", "EBUSY", "EEXIST", "ENFILE", "EMFILE"]);
-
-const PY_SLOW_SPAWN_MS = 3000;
-
-function isTransientFsError(error) {
-  return Boolean(error) && TRANSIENT_FS_CODES.has(error.code);
-}
-
-// Synchronous sleep for the retry backoff (no event loop work to do mid-retry).
-// Atomics.wait on a private buffer blocks the thread for the full timeout, so no
-// busy-wait is needed.
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, Math.round(ms)));
-}
-
-function retryTransient(action, attempts = RENAME_RETRY_ATTEMPTS, baseDelay = RENAME_RETRY_BASE_DELAY, maxDelay = RENAME_RETRY_MAX_DELAY) {
-  let delay = baseDelay;
-  let lastError;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      return action();
-    } catch (error) {
-      if (!isTransientFsError(error)) throw error;
-      lastError = error;
-      if (attempt === attempts - 1) break;
-      sleepSync(Math.min(delay, maxDelay) * (0.5 + Math.random()));
-      delay = Math.min(delay * 1.7, maxDelay);
-    }
-  }
-  if (lastError) throw lastError;
-  return undefined;
-}
-
-function nowMs() {
-  return Date.now();
-}
-
-function isoNow() {
-  return new Date().toISOString();
-}
-
-// Read the Cursor conversation identity that the agent terminal exposes via
-// environment variables (set by Cursor for agent-exec terminals). Used to
-// auto-fill the panel's per-session conversation id / workspace label so the
-// user never has to paste a request id by hand. All optional -- absent on a
-// plain user terminal, in which case the fields are simply empty.
-function captureAgentEnv() {
-  return {
-    conversation_id: process.env.CURSOR_CONVERSATION_ID || "",
-    workspace_label: process.env.CURSOR_WORKSPACE_LABEL || "",
-    cursor_agent: process.env.CURSOR_AGENT === "1",
-  };
-}
-
-function safeSessionId(value) {
-  const raw = String(value == null ? "" : value).trim().toLowerCase();
-  const cleaned = raw.replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
-  return cleaned || "agent-1";
-}
-
-function normalizePayload(item) {
-  if (typeof item === "string") {
-    return {
-      status: "continue",
-      user_input: item,
-      selected_choice: null,
-      file_paths: [],
-      image_paths: [],
-      suggested_tools: [],
-    };
-  }
-  if (!item || typeof item !== "object") return normalizePayload("");
-  const payload = item.payload && typeof item.payload === "object" ? item.payload : item;
-  return {
-    status: payload.status || "continue",
-    user_input: String(payload.user_input || item.message || ""),
-    selected_choice: payload.selected_choice != null ? payload.selected_choice : null,
-    file_paths: (payload.file_paths || []).filter(Boolean).map(String),
-    image_paths: (payload.image_paths || []).filter(Boolean).map(String),
-    suggested_tools: (payload.suggested_tools || []).filter(Boolean).map(String),
-  };
-}
-
-function normalizeQueue(data) {
-  if (Array.isArray(data)) return data;
-  if (data && Array.isArray(data.messages)) return data.messages;
-  if (data && typeof data === "object" && (data.payload || data.message || data.id)) return [data];
-  return [];
-}
-
-function makeQueueItem(payloadInput, source, target) {
-  const payload = normalizePayload(payloadInput);
-  return {
-    id: crypto.randomUUID().replace(/-/g, ""),
-    payload,
-    message: payload.user_input,
-    source,
-    target,
-    created_at: isoNow(),
-    created_at_ms: nowMs(),
-    pid: process.pid,
-  };
-}
+// Constants + stateless data-contract helpers now live in shared.js, so this
+// runtime and the extension host can never disagree on the queue item shape,
+// the default settings, or the transient-fs set again. The classes below keep
+// their own IO/caching, but use these shared primitives -- and MUST keep the
+// lock semantics (mkdir + owner token) identical to extension.js.
+const shared = require("./shared.js");
+const {
+  IMAGE_EXTENSIONS, TEXT_EXTENSIONS, TRANSIENT_FS_CODES,
+  RENAME_RETRY_ATTEMPTS, RENAME_RETRY_BASE_DELAY, RENAME_RETRY_MAX_DELAY,
+  BEST_EFFORT_ATTEMPTS, READ_RETRY_ATTEMPTS, LOCK_STALE_MS, LOCK_WAIT_SECONDS,
+  BEACON_INTERVAL_MS, BEACON_STALE_MS, BEACON_MAX_LIFETIME_MS,
+  DEFAULT_SETTINGS,
+  nowMs, isoNow, sleepSync, isTransientFsError, retryTransient,
+  captureAgentEnv, safeSessionId,
+  normalizePayload, normalizeQueue, makeQueueItem, queueSignature,
+  isProcessAlive, createQueueNotifier,
+} = shared;
 
 class ProjectState {
   constructor(stateDir) {
@@ -281,7 +163,33 @@ class ProjectState {
       // bytes per line heuristic). Avoids reading the whole file on every append.
       const stat = fs.statSync(filePath);
       if (stat.size < limit * 512) return;
-      const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/).filter(Boolean);
+      // Stream-friendly trim: read a tail chunk sized to comfortably hold
+      // `limit` lines (capped so we never read more than 8MB just to trim).
+      // If the chunk yields enough lines we avoid loading the whole file.
+      const tailBudget = Math.min(Math.max(limit * 1024, 65536), 8 * 1024 * 1024);
+      const start = Math.max(0, stat.size - tailBudget);
+      const length = stat.size - start;
+      let text;
+      {
+        const fd = fs.openSync(filePath, "r");
+        try {
+          const buf = Buffer.alloc(length);
+          fs.readSync(fd, buf, 0, length, start);
+          text = buf.toString("utf8");
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
+      let lines = text.split(/\r?\n/).filter(Boolean);
+      // Drop the first line if we started mid-file (it is likely partial).
+      if (text.length === tailBudget && stat.size > tailBudget && lines.length > 1) {
+        lines = lines.slice(1);
+      }
+      if (lines.length < limit) {
+        // Tail chunk didn't hold enough lines (very long lines) — fall back to a
+        // full read. This is rare and only happens once per trim cycle.
+        lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/).filter(Boolean);
+      }
       if (lines.length <= limit) return;
       // Atomic rewrite (tmp + rename) so a concurrent append from another process
       // can't be clobbered by a partial trim write.
@@ -630,6 +538,21 @@ class SessionState {
 
 const MAX_TEXT_CONTEXT_BYTES = 256 * 1024;
 
+// If workspaceRoot is known, return a visible warning tag when a resolved path
+// falls outside it. This makes it obvious to both the user and the agent when a
+// referenced file lives beyond the project boundary (e.g. via ~ expansion),
+// without blocking legitimate cross-directory references.
+function isOutsideWorkspace(target, workspaceRoot) {
+  if (!workspaceRoot) return "";
+  try {
+    const rel = path.relative(workspaceRoot, target);
+    if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return "";
+    return "\n[注意：该路径位于工作区目录之外]";
+  } catch {
+    return "";
+  }
+}
+
 function readTextFile(filePath) {
   try {
     const stat = fs.statSync(filePath);
@@ -651,13 +574,14 @@ function readTextFile(filePath) {
   }
 }
 
-function renderFileContext(filePath) {
+function renderFileContext(filePath, workspaceRoot) {
   const target = path.resolve(filePath.replace(/^~(?=$|[\\/])/, os.homedir()));
+  const outsideNote = isOutsideWorkspace(target, workspaceRoot);
   let stat;
   try {
     stat = fs.statSync(target);
   } catch {
-    return `\n\n[文件不存在: ${target}]`;
+    return `\n\n[文件不存在: ${target}]${outsideNote}`;
   }
   if (stat.isDirectory()) {
     let children;
@@ -666,25 +590,102 @@ function renderFileContext(filePath) {
     } catch (error) {
       children = [`[读取目录失败: ${error.message}]`];
     }
-    return `\n\n[目录上下文: ${target}]\n${children.slice(0, 300).join("\n")}\n[/目录上下文]`;
+    return `\n\n[目录上下文: ${target}]${outsideNote}\n${children.slice(0, 300).join("\n")}\n[/目录上下文]`;
   }
-  if (!stat.isFile()) return `\n\n[文件不存在: ${target}]`;
+  if (!stat.isFile()) return `\n\n[文件不存在: ${target}]${outsideNote}`;
   const ext = path.extname(target).toLowerCase();
-  if (IMAGE_EXTENSIONS.has(ext)) return renderImageContext(target);
-  if (!TEXT_EXTENSIONS.has(ext)) return `\n\n[附件路径: ${target}]`;
-  return `\n\n[文件上下文: ${target}]\n${readTextFile(target)}\n[/文件上下文]`;
+  if (IMAGE_EXTENSIONS.has(ext)) return renderImageContext(target, workspaceRoot);
+  if (!TEXT_EXTENSIONS.has(ext)) return `\n\n[附件路径: ${target}]${outsideNote}`;
+  return `\n\n[文件上下文: ${target}]${outsideNote}\n${readTextFile(target)}\n[/文件上下文]`;
 }
 
-function renderImageContext(filePath) {
-  let target = path.resolve(filePath.replace(/^~(?=$|[\\/])/, os.homedir()));
+// Directories that would flood a folder tree with generated / vendored files;
+// skipped when rendering a referenced folder so the tree stays useful.
+const FOLDER_SKIP_DIRS = new Set([
+  "node_modules", ".git", ".hg", ".svn", "dist", "out", "build", ".next",
+  ".nuxt", ".venv", "venv", "__pycache__", ".cache", ".idea", ".vscode-test",
+  "coverage", ".gradle", "target", "bin", "obj", ".turbo", ".parcel-cache",
+]);
+const FOLDER_MAX_ENTRIES = 400;
+const FOLDER_MAX_DEPTH = 4;
+
+// Render a referenced folder as a bounded, readable tree so the agent learns the
+// structure without flooding stdout. Depth- and count-capped, skips heavy vendor
+// dirs, and marks where it truncated. The agent uses its own tools to open files.
+function renderFolderContext(folderPath, workspaceRoot) {
+  const root = path.resolve(String(folderPath).replace(/^~(?=$|[\\/])/, os.homedir()));
+  const outsideNote = isOutsideWorkspace(root, workspaceRoot);
+  let rootStat;
   try {
-    if (!fs.statSync(target).isFile()) return `\n\n[图片不存在: ${target}]`;
+    rootStat = fs.statSync(root);
   } catch {
-    return `\n\n[图片不存在: ${target}]`;
+    return `\n\n[文件夹不存在: ${root}]${outsideNote}`;
+  }
+  if (!rootStat.isDirectory()) return renderFileContext(root, workspaceRoot);
+
+  const lines = [];
+  let count = 0;
+  let truncated = false;
+  // Track canonical (realpath) directories we've already walked to detect
+  // symlink cycles. Without this a self-referencing symlink would loop until
+  // FOLDER_MAX_ENTRIES is hit, flooding the output with repeated entries.
+  const visited = new Set();
+  const walk = (dir, prefix, depth) => {
+    if (truncated) return;
+    let realDir;
+    try { realDir = fs.realpathSync(dir); } catch { realDir = dir; }
+    if (visited.has(realDir)) {
+      lines.push(`${prefix}[循环已跳过]`);
+      count += 1;
+      return;
+    }
+    visited.add(realDir);
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (error) {
+      lines.push(`${prefix}[读取失败: ${error.message}]`);
+      return;
+    }
+    // Directories first, then files; each alphabetically -- a stable, scannable order.
+    entries.sort((a, b) => {
+      const ad = a.isDirectory() ? 0 : 1;
+      const bd = b.isDirectory() ? 0 : 1;
+      return ad !== bd ? ad - bd : a.name.localeCompare(b.name);
+    });
+    for (const entry of entries) {
+      if (count >= FOLDER_MAX_ENTRIES) { truncated = true; return; }
+      const isDir = entry.isDirectory();
+      if (isDir && FOLDER_SKIP_DIRS.has(entry.name)) {
+        lines.push(`${prefix}${entry.name}/  [已跳过]`);
+        count += 1;
+        continue;
+      }
+      lines.push(`${prefix}${entry.name}${isDir ? "/" : ""}`);
+      count += 1;
+      if (isDir) {
+        if (depth + 1 <= FOLDER_MAX_DEPTH) walk(path.join(dir, entry.name), `${prefix}  `, depth + 1);
+        else lines.push(`${prefix}  …（更深层级已省略）`);
+      }
+    }
+  };
+  walk(root, "", 1);
+  const note = truncated ? `\n…（条目超过 ${FOLDER_MAX_ENTRIES} 项已截断；请用文件工具浏览更多）` : "";
+  const body = lines.length ? lines.join("\n") : "（空文件夹）";
+  return `\n\n[文件夹上下文: ${root}]${outsideNote}\n${body}${note}\n[/文件夹上下文]`;
+}
+
+function renderImageContext(filePath, workspaceRoot) {
+  let target = path.resolve(filePath.replace(/^~(?=$|[\\/])/, os.homedir()));
+  const outsideNote = isOutsideWorkspace(target, workspaceRoot);
+  try {
+    if (!fs.statSync(target).isFile()) return `\n\n[图片不存在: ${target}]${outsideNote}`;
+  } catch {
+    return `\n\n[图片不存在: ${target}]${outsideNote}`;
   }
   const name = path.basename(target);
   return (
-    `\n\n[图片上下文: ${name}]\n` +
+    `\n\n[图片上下文: ${name}]${outsideNote}\n` +
     "图片已保存到本地。请使用 Read / 读取文件工具打开下面的路径来查看图像内容" +
     "（这是真实的图片文件，不要当作纯文本或尝试手动解码）：\n" +
     `${target}\n` +
@@ -692,14 +693,15 @@ function renderImageContext(filePath) {
   );
 }
 
-function renderPayload(payload) {
+function renderPayload(payload, workspaceRoot) {
   const status = payload.status || "continue";
   if (status === "stop") return "stop";
   const parts = [];
   if (payload.selected_choice) parts.push(`已选择: ${payload.selected_choice}`);
   if (payload.user_input) parts.push(payload.user_input);
-  for (const filePath of payload.file_paths || []) parts.push(renderFileContext(filePath));
-  for (const imagePath of payload.image_paths || []) parts.push(renderImageContext(imagePath));
+  for (const filePath of payload.file_paths || []) parts.push(renderFileContext(filePath, workspaceRoot));
+  for (const folderPath of payload.folder_paths || []) parts.push(renderFolderContext(folderPath, workspaceRoot));
+  for (const imagePath of payload.image_paths || []) parts.push(renderImageContext(imagePath, workspaceRoot));
   if ((payload.suggested_tools || []).length) parts.push(`\n建议工具: ${payload.suggested_tools.join(", ")}`);
   return parts.filter(Boolean).join("\n").trim();
 }
@@ -713,16 +715,20 @@ function keepaliveMessage(sessionId, rerunCmd) {
 function buildRerunCmd(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report, reportStatus) {
   const script = process.argv[1] || "";
   const stateDir = project.stateDir;
+  // Escape a value for use inside a double-quoted shell argument. Backslashes
+  // are left literal (Windows paths rely on that); only the characters that can
+  // break out of the double-quote context are escaped.
+  const q = (v) => `"${String(v).replace(/"/g, '\\"').replace(/\$/g, "\\$").replace(/`/g, "\\`")}"`;
   const parts = [
-    `node "${script}" wait`,
-    `--state-dir "${stateDir}"`,
-    `--session-id ${sessionId}`,
-    `--keepalive ${keepaliveSeconds}`,
-    `--timeout ${timeoutSeconds}`,
-    `--poll ${pollSeconds}`,
+    `node ${q(script)} wait`,
+    `--state-dir ${q(stateDir)}`,
+    `--session-id ${q(sessionId)}`,
+    `--keepalive ${q(keepaliveSeconds)}`,
+    `--timeout ${q(timeoutSeconds)}`,
+    `--poll ${q(pollSeconds)}`,
   ];
-  if (report) parts.push(`--report "${report}"`);
-  if (reportStatus && reportStatus !== "done") parts.push(`--report-status ${reportStatus}`);
+  if (report) parts.push(`--report ${q(report)}`);
+  if (reportStatus && reportStatus !== "done") parts.push(`--report-status ${q(reportStatus)}`);
   return parts.join(" ");
 }
 
@@ -735,68 +741,8 @@ function sessionBusyMessage(sessionId, ownerPid) {
 请不要重复运行 wait、也不要去结束其它进程；请在续聊助手面板为本对话新建一个会话并复制其启动指令重开本循环，或让本对话改用一个唯一的 --session-id。`;
 }
 
-function queueSignature(filePath) {
-  try {
-    const stat = fs.statSync(filePath);
-    return `${stat.mtimeMs}:${stat.size}`;
-  } catch {
-    return null;
-  }
-}
-
-// Event-driven wakeup for the wait loop. We watch the *directories* that hold the
-// session and global queue files (not the files themselves: queue writes land via
-// atomic rename, which would orphan a file-bound watch) and wake the loop the
-// instant a relevant queue file changes, instead of sleeping out the whole poll
-// interval. fs.watch is best-effort -- some platforms/filesystems deliver no
-// events, or a null filename -- so the caller keeps a slower polling safety-net
-// on top of this; correctness never depends on an event actually arriving.
-function createQueueNotifier(targets) {
-  let pending = false;
-  let resolver = null;
-  let timer = null;
-
-  const fire = () => {
-    pending = true;
-    if (resolver) {
-      const resolve = resolver;
-      resolver = null;
-      if (timer) { clearTimeout(timer); timer = null; }
-      resolve();
-    }
-  };
-
-  const watchers = [];
-  for (const target of targets) {
-    try {
-      const watcher = fs.watch(target.dir, { persistent: false }, (eventType, filename) => {
-        // filename is null on some platforms -> wake unconditionally; the loop
-        // re-checks queue signatures anyway, so a spurious wake is cheap.
-        if (!filename || filename === target.file) fire();
-      });
-      watcher.on("error", () => { /* best effort; the polling safety-net covers gaps */ });
-      watchers.push(watcher);
-    } catch {
-      /* fs.watch unsupported here (e.g. some network filesystems) -> polling covers it */
-    }
-  }
-
-  return {
-    active: watchers.length > 0,
-    wait(maxMs) {
-      if (pending) { pending = false; return Promise.resolve(); }
-      return new Promise((resolve) => {
-        resolver = resolve;
-        timer = setTimeout(() => { resolver = null; timer = null; resolve(); }, Math.max(0, maxMs));
-      });
-    },
-    close() {
-      for (const watcher of watchers) { try { watcher.close(); } catch { /* ignore */ } }
-      watchers.length = 0;
-      if (timer) { clearTimeout(timer); timer = null; }
-    },
-  };
-}
+// queueSignature / createQueueNotifier / isProcessAlive and the BEACON_* cadence
+// constants are imported from shared.js at the top of this file.
 
 // --- Presence beacon ----------------------------------------------------------
 // During the agent's work between two `wait` calls no plugin process runs, so the
@@ -806,23 +752,9 @@ function createQueueNotifier(targets) {
 // self-terminates when the launching shell dies (terminal closed / conversation
 // interrupted). The panel then reads presence.json: fresh + no waiter == working;
 // stale == the terminal went away, i.e. interrupted -- detected within ~one
-// interval instead of a multi-minute time guess.
-const BEACON_INTERVAL_MS = 4000;
-const BEACON_STALE_MS = 12000;
-const BEACON_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000;
-
-function isProcessAlive(pid) {
-  const n = Number(pid);
-  if (!Number.isInteger(n) || n <= 0) return false;
-  try {
-    process.kill(n, 0);
-    return true;
-  } catch (error) {
-    // ESRCH -> gone; EPERM -> exists but not ours to signal (still alive).
-    return Boolean(error) && error.code === "EPERM";
-  }
-}
-
+// interval instead of a multi-minute time guess. (The MCP transport can't spawn a
+// terminal-bound beacon, so mcp-server.js writes an equivalent presence heartbeat
+// itself; both use the shared BEACON_* cadence so the panel's staleness math matches.)
 function spawnBeaconIfNeeded(project, session) {
   try {
     const existing = session.readJson(session.presencePath, null);
@@ -887,7 +819,10 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
   project.registerSession(sessionId);
   const session = project.session(sessionId);
   const runId = crypto.randomUUID().replace(/-/g, "");
-  if (report) session.recordResult(report, reportStatus, runId);
+  if (report) {
+    session.recordResult(report, reportStatus, runId);
+    notifyWebhookResult(project, sessionId, report, reportStatus, { transport: "shell" });
+  }
   const [acquired, owner] = session.acquireWaiter(runId);
   if (!acquired) {
     session.writeStatus(runId, "busy", { last_error: "another waiter is already active", active_waiter: owner });
@@ -1016,7 +951,9 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
       }
       if (item) {
         const payload = normalizePayload(item);
-        const rendered = renderPayload(payload);
+        // stateDir is <workspace>/.cursor/local-continue-state -> workspace root is two levels up.
+        const wsRoot = path.dirname(path.dirname(project.stateDir));
+        const rendered = renderPayload(payload, wsRoot);
         const ack = {
           id: item.id,
           payload,
@@ -1039,7 +976,7 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
           uptime_ms: nowMs() - startedAtMs,
         });
         clearSpinner();
-        process.stdout.write(`${rendered}\n`);
+        process.stdout.write(`${applySessionScope(project, sessionId, rendered)}\n`);
         return 0;
       }
 
@@ -1081,16 +1018,12 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
 }
 
 // --- F-6 doctor ---------------------------------------------------------------
-function pythonLauncherCommand() {
-  return process.platform === "win32" ? "py" : "python3";
-}
-
 function timeSubprocess(cmd, args) {
   const start = process.hrtime.bigint();
   let result;
-  // Bare command names (node/py/python3) need shell PATH/PATHEXT resolution on
-  // Windows; absolute paths (process.execPath, which may contain spaces) must NOT
-  // go through the shell or the space breaks the command.
+  // A bare command name (node) needs shell PATH/PATHEXT resolution on Windows;
+  // an absolute path (process.execPath, which may contain spaces) must NOT go
+  // through the shell or the space breaks the command.
   const useShell = process.platform === "win32" && !path.isAbsolute(cmd);
   try {
     result = spawnSync(cmd, args, { encoding: "utf8", timeout: 60000, shell: useShell });
@@ -1130,15 +1063,6 @@ function doctorFindings(report) {
   if (typeof nodeSelf.ms === "number") {
     findings.push(`Node 自启动 ${nodeSelf.ms.toFixed(0)}ms（这是本运行时的实际冷启动成本）。`);
   }
-  const launcher = report.python_launcher || {};
-  const worst = typeof launcher.ms === "number" ? launcher.ms : null;
-  if (worst !== null && worst > PY_SLOW_SPAWN_MS) {
-    if (process.platform === "win32") {
-      findings.push(`Python 冷启动 ${worst.toFixed(0)}ms 偏慢，疑似杀毒软件实时扫描拖慢；改用本 Node 运行时可绕开该问题。`);
-    } else {
-      findings.push(`Python 冷启动 ${worst.toFixed(0)}ms 偏慢，可能受磁盘/IO 影响。`);
-    }
-  }
   const nodePath = report.node_path || {};
   if (nodePath.ok) {
     findings.push(`PATH 中存在 node（${nodePath.out}）。`);
@@ -1167,7 +1091,6 @@ function runDoctor(project, sessionId) {
     node_self: timeSubprocess(process.execPath, ["-e", "0"]),
     node_path: timeSubprocess("node", ["--version"]),
   };
-  report.python_launcher = { command: pythonLauncherCommand(), ...timeSubprocess(pythonLauncherCommand(), ["-c", "pass"]) };
   report.state_dir_write = checkStateWritable(project);
   if (sessionId) report.waiter = project.session(sessionId).currentWaiter();
   report.findings = doctorFindings(report);
@@ -1194,7 +1117,6 @@ function renderDoctor(report) {
     "-".repeat(36),
     `Node 自启动:    ${fmt(report.node_self)}`,
     `PATH node:      ${fmt(report.node_path)}`,
-    `Python[${(report.python_launcher || {}).command}]:    ${fmt(report.python_launcher)}`,
     `状态目录可写:   ${fmt(report.state_dir_write)}`,
     "-".repeat(36),
     "诊断结论:",
@@ -1292,9 +1214,73 @@ async function main() {
 // Export the reusable pieces so other runtimes (e.g. the MCP server) can drive
 // the very same on-disk queue/session/state machine instead of duplicating it.
 // Only auto-run the CLI when executed directly, never when `require`d.
+// Fire the opt-in result webhook when a session finishes a turn and re-enters
+// the wait loop (i.e. it reported a result). Both the shell `wait --report` path
+// and the MCP wait/report paths route through here. Fire-and-forget: any failure
+// is swallowed so it can never disrupt the bridge loop.
+function notifyWebhookResult(project, sessionId, summary, resultStatus = "done", extra = {}) {
+  let settings;
+  try {
+    settings = project.settings();
+  } catch {
+    return;
+  }
+  const url = settings && settings.webhookUrl ? String(settings.webhookUrl).trim() : "";
+  if (!url) return;
+  const status = ["done", "need_input", "error"].includes(resultStatus) ? resultStatus : "done";
+  if (!shared.webhookEventsList(settings).includes(status)) return;
+  const id = safeSessionId(sessionId);
+  let name = id;
+  let workspaceRoot = "";
+  try {
+    const item = project.sessionsIndex().sessions.find((entry) => entry.id === id);
+    if (item && item.name) name = item.name;
+  } catch { /* ignore */ }
+  try {
+    // stateDir is <workspace>/.cursor/local-continue-state -> up two levels.
+    workspaceRoot = path.dirname(path.dirname(project.stateDir));
+  } catch { /* ignore */ }
+  const body = {
+    event: "session_result",
+    session_id: id,
+    session_name: name,
+    status,
+    summary: String(summary || "").slice(0, 2000),
+    transport: extra.transport || "",
+    workspace: workspaceRoot ? path.basename(workspaceRoot) : "",
+    workspace_path: workspaceRoot,
+    at: isoNow(),
+  };
+  Promise.resolve(shared.postWebhook(url, body, { timeoutMs: 8000 })).catch(() => { /* best effort */ });
+}
+
+// Per-session project scope: a workspace may hold many projects, so a session
+// can be pinned to one project directory. When set, prepend a concise scope note
+// to each instruction handed to that session so the agent keeps its work inside
+// that folder. Read from the shared sessions index (written by the panel), so it
+// works over both the shell and MCP transports with no payload change.
+function sessionProjectDir(project, sessionId) {
+  try {
+    const item = project.sessionsIndex().sessions.find((entry) => entry.id === safeSessionId(sessionId));
+    return item && item.projectDir ? String(item.projectDir).trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function applySessionScope(project, sessionId, rendered) {
+  if (!rendered || rendered === "stop") return rendered;
+  const dir = sessionProjectDir(project, sessionId);
+  if (!dir) return rendered;
+  return `[项目范围] 本会话负责的项目目录：\`${dir}\`。请只在该目录内进行开发/操作；本工作区包含多个项目，未经我明确要求，不要改动此目录以外的内容。\n\n${rendered}`;
+}
+
 module.exports = {
   ProjectState,
   SessionState,
+  notifyWebhookResult,
+  sessionProjectDir,
+  applySessionScope,
   renderPayload,
   normalizePayload,
   makeQueueItem,

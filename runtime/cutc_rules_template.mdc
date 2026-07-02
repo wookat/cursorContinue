@@ -21,6 +21,7 @@ alwaysApply: true
 4. 一个 Cursor 对话只用一个 `--session-id`。如果面板复制来的启动指令里带了别的 `--session-id`，用它给出的那个，**不要多个对话共用同一个 ID**。若看到 `SESSION_BUSY` 或 `another instruction waiter is already active`，说明两个对话撞了同一个 ID——按下表处理，**绝不要去杀进程或反复重试抢锁**。
 5. **所有回复必须使用简体中文。**
 6. **真正的回答必须出现在聊天面板中**，不能只存在于终端输出里。
+7. **完成一轮任务不是结束循环的理由**：每当你执行完一条指令、或自认为任务已彻底做完，都必须**立即再次进入等待**（运行 wait 命令 / 调用 `wait_for_instruction`）。是否结束由用户的 `stop` 决定，不由你决定——只有收到 `stop` 才结束循环。MCP 模式下工具返回的 `next_action` 字段若为 `call_wait_for_instruction`，就必须继续调用。
 
 <FORBIDDEN_OPERATIONS>
 **不要修改或删除 .cursor/local-continue-state 目录**

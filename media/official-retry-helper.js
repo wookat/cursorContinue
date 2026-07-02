@@ -61,6 +61,23 @@
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const log = (...args) => { if (DEBUG) console.log("[LCA Retry]", ...args); };
 
+  // --- Active-session sync (① show number on the icon / ② panel auto-select) ---
+  // The extension bakes window.__lcaChannel = { base, span, token } into the
+  // patch (see patchBlock). We scan the active conversation for the pasted
+  // "当前会话 ID：agent-X" line to (①) show the session number on the injected
+  // icon and (②) POST it to the loopback channel so the panel selects that
+  // session when you switch conversations. Both are best-effort: if the channel
+  // is unreachable (e.g. renderer CSP blocks the fetch), ① still works.
+  const CH = (typeof window !== "undefined" && window.__lcaChannel) || {};
+  const CH_BASE = Number(CH.base) > 0 ? Number(CH.base) : 48090;
+  const CH_SPAN = Number(CH.span) > 0 ? Number(CH.span) : 30;
+  const CH_TOKEN = CH.token || "";
+  const SESSION_RE = /当前会话\s*ID\s*[:：]\s*(agent-[A-Za-z0-9_-]+)/;
+  const SESSION_SCAN_MS = 800;
+  let chPort = 0;              // cached owner port for the active session
+  let lastPushedSession = ""; // last agent id we synced to the panel
+  let lastSessionScan = 0;
+
   function retryGapMs(count) {
     if (count <= 5) return 500;
     if (count <= 20) return 1000;
@@ -346,6 +363,7 @@
 
   function doChecks() {
     injectButtons();
+    maybeSessionScan();
     ensureHideStyle();
     hideErrorBubbles();
     if (enabled && mode !== "RETRYING" && q(".composer-warning-popup")) {
@@ -408,6 +426,9 @@
       ".lca-retry-btn .lca-ico { display: inline-flex; align-items: center; justify-content: center; }",
       ".lca-retry-btn.lca-spinning .lca-ico { animation: lca-spin 0.8s linear infinite; transform-origin: 50% 50%; }",
       ".lca-retry-btn .lca-num { font-size: 9px; font-weight: 800; line-height: 1; }",
+      ".lca-sess { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 20px; padding: 0 6px; margin-left: 2px; box-sizing: border-box; border-radius: 999px; font-size: 10px; font-weight: 800; line-height: 1; color: #e5e7eb; background: rgba(148, 163, 184, 0.28); cursor: pointer; user-select: none; flex-shrink: 0; transition: background 140ms ease; }",
+      ".lca-sess:hover { background: rgba(148, 163, 184, 0.45); }",
+      ".lca-sess::before { content: '#'; opacity: 0.6; margin-right: 1px; }",
     ].join("\n");
     (document.head || document.documentElement).appendChild(style);
   }
@@ -554,12 +575,139 @@
     document.querySelectorAll(".button-container.composer-button-area").forEach(injectButton);
   }
 
+  // Loopback fetch with a short timeout so a wrong/closed port never hangs the
+  // scan. Uses the original (unwrapped) fetch to avoid our 402 interceptor.
+  function chFetch(port, pathname, opts) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 600);
+    const options = Object.assign({ signal: controller.signal, cache: "no-store" }, opts || {});
+    return originalFetch(`http://127.0.0.1:${port}${pathname}`, options).finally(() => clearTimeout(timer));
+  }
+
+  // Find the channel port whose window owns this session. Each Cursor window
+  // binds its own port in [base, base+span); we probe the range and pick the one
+  // that reports ownership, caching it for next time.
+  async function findOwnerPort(agentId) {
+    const owns = async (port) => {
+      try {
+        const res = await chFetch(port, `/lca/ping?session=${encodeURIComponent(agentId)}`);
+        if (!res || !res.ok) return false;
+        const data = await res.json().catch(() => null);
+        return Boolean(data && data.app === "local-continue" && data.owns);
+      } catch (e) { return false; }
+    };
+    if (chPort && await owns(chPort)) return chPort;
+    for (let port = CH_BASE; port < CH_BASE + CH_SPAN; port++) {
+      if (port === chPort) continue;
+      if (await owns(port)) { chPort = port; return port; }
+    }
+    chPort = 0;
+    return 0;
+  }
+
+  // ② Tell the panel which session the active conversation belongs to, so it
+  // auto-selects it. Only fires when the active session actually changes.
+  async function pushActiveSession(agentId) {
+    if (!agentId || agentId === lastPushedSession) return;
+    let port = 0;
+    try { port = await findOwnerPort(agentId); } catch (e) { port = 0; }
+    if (!port) return; // channel unavailable — ① (icon number) still works
+    try {
+      const res = await chFetch(port, "/lca/active", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId, token: CH_TOKEN }),
+      });
+      if (res && res.ok) {
+        const data = await res.json().catch(() => null);
+        if (data && data.matched) { lastPushedSession = agentId; log("synced active session", agentId); }
+      }
+    } catch (e) { /* best effort */ }
+  }
+
+  function sessionScopeFor(area) {
+    return area.closest(".pane-body") || area.closest(".pane") || area.closest(".split-view-view") || document.body;
+  }
+
+  // Pull the pasted "当前会话 ID：agent-X" out of a conversation. Scans human
+  // message bubbles (textContent, no reflow) and fast-skips non-matching ones.
+  function detectSessionIdIn(scope) {
+    if (!scope) return "";
+    const nodes = scope.querySelectorAll('.composer-human-message, [data-message-index], [data-message-role="human"]');
+    for (const node of nodes) {
+      const text = node.textContent || "";
+      if (text.indexOf("当前会话") === -1) continue;
+      const match = text.match(SESSION_RE);
+      if (match) return match[1];
+    }
+    return "";
+  }
+
+  // agent-4-mr0fw2oa -> "4"; falls back to the first few id chars.
+  function sessionShortLabel(agentId) {
+    const num = /^agent-(\d+)/.exec(agentId);
+    if (num) return num[1];
+    const rest = /^agent-([A-Za-z0-9]+)/.exec(agentId);
+    return rest ? rest[1].slice(0, 4) : agentId;
+  }
+
+  function ensureSessionChip(area) {
+    let chip = area.querySelector(".lca-sess");
+    if (chip) return chip;
+    ensureRetryStyles();
+    chip = document.createElement("div");
+    chip.className = "lca-sess";
+    // Clicking the chip re-pushes the session so the user can force the panel to
+    // follow this conversation even if the auto-sync didn't fire.
+    chip.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const id = chip.dataset.agentId || "";
+      if (id) { lastPushedSession = ""; pushActiveSession(id); }
+    };
+    const retry = area.querySelector(".lca-retry-btn");
+    if (retry) area.insertBefore(chip, retry); else area.appendChild(chip);
+    return chip;
+  }
+
+  // ① Show the session number on the injected icon for each composer, and return
+  // the id of the active (visible) conversation for ② auto-select. Only continue
+  // conversations (those with the pasted session id) get a chip; others don't.
+  function updateSessionChips() {
+    let active = "";
+    document.querySelectorAll(".button-container.composer-button-area").forEach((area) => {
+      const id = detectSessionIdIn(sessionScopeFor(area));
+      let chip = area.querySelector(".lca-sess");
+      if (id) {
+        if (!chip) chip = ensureSessionChip(area);
+        chip.dataset.agentId = id;
+        const label = sessionShortLabel(id);
+        if (chip.textContent !== label) chip.textContent = label;
+        chip.title = `续聊助手会话：${id}（点击在面板选中）`;
+        if (area.offsetParent !== null) active = id;
+      } else if (chip) {
+        chip.remove();
+      }
+    });
+    return active;
+  }
+
+  function maybeSessionScan() {
+    const now = Date.now();
+    if (now - lastSessionScan < SESSION_SCAN_MS) return;
+    lastSessionScan = now;
+    let active = "";
+    try { active = updateSessionChips(); } catch (e) { /* DOM shape changed */ }
+    if (active) pushActiveSession(active);
+  }
+
   function bootstrap() {
     if (!document.body) {
       setTimeout(bootstrap, 100);
       return;
     }
     injectButtons();
+    maybeSessionScan();
     ensureHideStyle();
     ensureObserver();
     if (pollTimer) clearInterval(pollTimer);
@@ -609,6 +757,7 @@
     if (checkTimer) { clearTimeout(checkTimer); checkTimer = null; }
     if (decayTimer) { clearTimeout(decayTimer); decayTimer = null; }
     document.querySelectorAll(".lca-retry-btn").forEach((element) => element.remove());
+    document.querySelectorAll(".lca-sess").forEach((element) => element.remove());
     const hideStyle = document.getElementById("lca-hide-style");
     if (hideStyle) hideStyle.remove();
     while (hiddenNodes.length) {

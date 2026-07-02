@@ -3,7 +3,7 @@
 
   const vscode = acquireVsCodeApi();
   const state = {
-    draft: { file_paths: [], image_paths: [] },
+    draft: { file_paths: [], image_paths: [], folder_paths: [] },
     settings: {},
     sessions: [],
     selectedSessionId: "",
@@ -273,6 +273,7 @@
       session.queueLength || 0, session.lastResultStatus || "", session.lastResultAtMs || 0,
       session.id === state.selectedSessionId ? 1 : 0,
       session.overrides ? 1 : 0,
+      session.projectDir || "",
       session.conversationShort || "",
       session.activity || "",
       session.interruptReason || "",
@@ -286,16 +287,32 @@
     const cidChip = session.conversationShort
       ? `<span class="session-cid" role="button" tabindex="0" data-copy-cid="${escapeHtml(session.conversationId)}" title="Cursor 会话 ID：${escapeHtml(session.conversationId)}（点击复制）">🔗 ${escapeHtml(session.conversationShort)}</span>`
       : "";
+    // A folder chip when the session is pinned to a project dir, so the user can
+    // see at a glance that this session only works inside that one project.
+    const projectChip = session.projectDir
+      ? `<span class="session-project" title="项目目录：${escapeHtml(session.projectDir)}（本会话只在此目录内工作）">📁 ${escapeHtml(session.projectName || session.projectDir)}</span>`
+      : "";
+    // Surface handoff inline exactly when it's relevant: a session that stalled
+    // (waiter didn't return to wait) or dropped offline is the prime candidate to
+    // hand its unfinished work to another session (contextual revelation).
+    const needsHandoff = session.activity === "stalled" || (!session.connected && !!session.state && session.state !== "new");
+    const quickHandoff = needsHandoff
+      ? `<button class="session-quick-handoff" data-quick-handoff="${escapeHtml(session.id)}" title="把该会话未完成的工作转接给其它会话继续">↪ 转接</button>`
+      : "";
     const html = `
-      <button class="session-card ${session.id === state.selectedSessionId ? "selected" : ""}${attentionClass(session)}" data-session-id="${escapeHtml(session.id)}">
+      <div class="session-card ${session.id === state.selectedSessionId ? "selected" : ""}${attentionClass(session)}" role="button" tabindex="0" aria-label="会话 ${escapeHtml(session.name || session.id)}" data-session-id="${escapeHtml(session.id)}">
         <span class="${sessionDotClass(session)}"></span>
         <span class="session-main">
-          <span class="session-name">${escapeHtml(session.name || session.id)}${session.overrides ? ' <span class="session-override" title="使用自定义参数">⚙</span>' : ""}${cidChip}</span>
+          <span class="session-name">${escapeHtml(session.name || session.id)}${session.overrides ? ' <span class="session-override" title="使用自定义参数">⚙</span>' : ""}${cidChip}${projectChip}</span>
           <span class="session-meta ${session.activity === "working" ? "meta-working" : session.activity === "stalled" ? "meta-stalled" : ""}">${escapeHtml(sessionStateLabel(session))}</span>
           ${resultBadge(session)}
         </span>
-        <span class="session-queue">队列 ${session.queueLength || 0}</span>
-      </button>`;
+        <span class="session-side">
+          ${quickHandoff}
+          <span class="session-queue">队列 ${session.queueLength || 0}</span>
+          <button class="session-menu-btn" data-session-menu="${escapeHtml(session.id)}" aria-haspopup="menu" aria-label="会话操作" title="会话操作（也可右键卡片）">⋯</button>
+        </span>
+      </div>`;
     _sessionCardCache.set(session.id, { sig, html });
     return html;
   }
@@ -305,13 +322,26 @@
     $("setSchedulingMode").value = state.settings.schedulingMode ?? "direct";
     $("setKeepalive").value = state.settings.keepaliveSeconds ?? 300;
     $("setNotifyOnAttention").checked = state.settings.notifyOnAttention !== false;
+    $("setWebhookUrl").value = state.settings.webhookUrl ?? "";
+    const webhookEvents = Array.isArray(state.settings.webhookEvents) ? state.settings.webhookEvents : ["done", "need_input", "error"];
+    $("setWebhookOnlyAttention").checked = !webhookEvents.includes("done");
   }
 
   function renderAttachments() {
     const rows = [
+      ...state.draft.folder_paths.map((filePath) => ({ kind: "文件夹", path: filePath, bucket: "folder_paths" })),
       ...state.draft.file_paths.map((filePath) => ({ kind: "文件", path: filePath, bucket: "file_paths" })),
       ...state.draft.image_paths.map((filePath) => ({ kind: "图片", path: filePath, bucket: "image_paths" })),
     ];
+    // Periodically prune thumbnail cache entries that no longer correspond to a
+    // current image attachment, so thumbs/thumbReq can't grow unbounded over a
+    // long session with many pasted images.
+    if (Object.keys(state.thumbs).length > 80) {
+      const live = new Set(state.draft.image_paths);
+      for (const key of Object.keys(state.thumbs)) {
+        if (!live.has(key)) { delete state.thumbs[key]; delete state.thumbReq[key]; }
+      }
+    }
     const sig = `${rows.length}|${rows.map((r) => `${r.bucket}:${r.path}`).join("\u0001")}|${Object.keys(state.thumbs).length}`;
     if (sig === state._lastAttachSig) return;
     state._lastAttachSig = sig;
@@ -340,10 +370,11 @@
     send("requestThumb", { path: imagePath });
   }
 
-  function addPaths(paths) {
+  function addPaths(paths, kind) {
     for (const filePath of paths || []) {
-      const isImage = /\.(png|jpe?g|gif|bmp|webp)$/i.test(String(filePath));
-      const target = isImage ? state.draft.image_paths : state.draft.file_paths;
+      const isFolder = kind === "folder";
+      const isImage = !isFolder && /\.(png|jpe?g|gif|bmp|webp)$/i.test(String(filePath));
+      const target = isFolder ? state.draft.folder_paths : isImage ? state.draft.image_paths : state.draft.file_paths;
       if (!target.includes(filePath)) {
         target.push(filePath);
         if (isImage) requestThumb(filePath);
@@ -356,7 +387,9 @@
     const payload = entry.payload || {};
     const filePaths = payload.file_paths || [];
     const imagePaths = payload.image_paths || [];
+    const folderPaths = payload.folder_paths || [];
     let tagsHtml = "";
+    for (let i = 0; i < folderPaths.length; i++) tagsHtml += '<span class="queued-tag">文件夹</span>';
     for (let i = 0; i < filePaths.length; i++) tagsHtml += '<span class="queued-tag">文件</span>';
     for (let i = 0; i < imagePaths.length; i++) tagsHtml += '<span class="queued-tag">图片</span>';
     const thumbs = imagePaths
@@ -441,7 +474,9 @@
       </section>
     `;
     const button = $("inlineQueueOpen");
-    if (button) button.addEventListener("click", () => { openModal("queueDialog"); renderQueue(); });
+    // Replace any previous handler via onclick (not addEventListener) so repeated
+    // renders don't stack duplicate listeners on the same element.
+    if (button) button.onclick = () => { openModal("queueDialog"); renderQueue(); };
   }
 
   function renderEvents() {
@@ -484,6 +519,7 @@
       selected_choice: undefined,
       file_paths: state.draft.file_paths,
       image_paths: state.draft.image_paths,
+      folder_paths: state.draft.folder_paths,
       suggested_tools: [],
     };
     send("send", {
@@ -492,7 +528,7 @@
       sessionId: state.selectedSessionId,
     });
     $("instruction").value = "";
-    state.draft = { file_paths: [], image_paths: [] };
+    state.draft = { file_paths: [], image_paths: [], folder_paths: [] };
     renderAttachments();
   }
 
@@ -505,6 +541,8 @@
         schedulingMode: $("setSchedulingMode").value || "direct",
         keepaliveSeconds: Number($("setKeepalive").value || 300),
         notifyOnAttention: $("setNotifyOnAttention").checked,
+        webhookUrl: ($("setWebhookUrl").value || "").trim(),
+        webhookEvents: $("setWebhookOnlyAttention").checked ? ["need_input", "error"] : ["done", "need_input", "error"],
       },
     });
     closeModal("settingsDialog");
@@ -603,34 +641,128 @@
     closeModal("handoffDialog");
   }
 
+  // ---- Per-session action menu (⋯ button + right-click) --------------------
+  // Right-click / ⋯ open the SAME menu so mouse, touch and keyboard users have
+  // parity (the context menu is a redundant power-user shortcut, never the only
+  // path). Every per-session action now lives here instead of the global "更多".
+  let _menuSessionId = "";
+
+  function sessionMenuModel(session) {
+    const hasProject = !!(session && session.projectDir);
+    const items = [
+      { action: "handoff", icon: "↪", label: "会话转接…", hint: "交给其它会话" },
+      { action: "rename", icon: "✎", label: "重命名会话" },
+      // Pin the session to one project folder inside a multi-project workspace so
+      // the agent only works there; the hint shows the current target when set.
+      { action: "setProject", icon: "📁", label: hasProject ? "更改项目目录…" : "设置项目目录…", hint: hasProject ? (session.projectName || "已限定") : "限定到某个项目" },
+    ];
+    if (hasProject) items.push({ action: "clearProject", icon: "⊘", label: "取消项目目录限定" });
+    items.push(
+      { action: "params", icon: "⚙", label: "会话参数…" },
+      { sep: true },
+      { action: "copyInstruction", icon: "⧉", label: "复制启动指令" },
+      { action: "startWait", icon: "▶", label: "启动等待终端" },
+      { action: "clearQueue", icon: "⌫", label: "清空该会话队列" },
+      { sep: true },
+      { action: "stop", icon: "■", label: "停止循环", danger: true },
+      { action: "delete", icon: "🗑", label: "删除会话", danger: true },
+    );
+    return items;
+  }
+
+  function renderSessionMenu(session) {
+    return sessionMenuModel(session).map((it) => {
+      if (it.sep) return '<div class="context-menu-sep"></div>';
+      return `<button class="context-menu-item${it.danger ? " danger" : ""}" role="menuitem" tabindex="-1" data-menu-action="${it.action}">`
+        + `<span class="cm-ico">${it.icon}</span><span class="cm-label">${escapeHtml(it.label)}</span>`
+        + `${it.hint ? `<span class="cm-hint">${escapeHtml(it.hint)}</span>` : ""}</button>`;
+    }).join("");
+  }
+
+  function selectSession(sessionId) {
+    if (!sessionId || state.selectedSessionId === sessionId) return;
+    state.selectedSessionId = sessionId;
+    renderSessions();
+    renderQueue();
+    const selected = selectedSession();
+    setTextIfChanged($("selectedSessionText"), selected ? `当前会话：${selected.name}` : "当前会话：未选择");
+  }
+
+  function openSessionMenu(sessionId, x, y) {
+    const session = (state.sessions || []).find((s) => s.id === sessionId);
+    if (!session) return;
+    _menuSessionId = sessionId;
+    // Keep the composer + selected-based dialogs (handoff/params) in sync with
+    // whichever session the menu was opened on.
+    selectSession(sessionId);
+    const menu = $("sessionMenu");
+    if (!menu) return;
+    menu.innerHTML = `<div class="context-menu-title">${escapeHtml(session.name || session.id)}</div>${renderSessionMenu(session)}`;
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+    menu.classList.remove("hidden");
+    // Flip / clamp so the menu never spills outside the panel viewport.
+    const rect = menu.getBoundingClientRect();
+    const pad = 8;
+    let left = x;
+    let top = y;
+    if (left + rect.width + pad > window.innerWidth) left = Math.max(pad, window.innerWidth - rect.width - pad);
+    if (top + rect.height + pad > window.innerHeight) top = Math.max(pad, y - rect.height);
+    menu.style.left = `${Math.max(pad, left)}px`;
+    menu.style.top = `${Math.max(pad, top)}px`;
+    const first = menu.querySelector(".context-menu-item");
+    if (first) first.focus();
+  }
+
+  function closeSessionMenu() {
+    const menu = $("sessionMenu");
+    if (menu && !menu.classList.contains("hidden")) menu.classList.add("hidden");
+  }
+
+  function runSessionMenuAction(action) {
+    const sid = _menuSessionId || state.selectedSessionId;
+    closeSessionMenu();
+    if (!sid) return;
+    switch (action) {
+      case "handoff": openHandoff(); break;
+      case "rename": send("renameSessionPrompt", { sessionId: sid }); break;
+      case "setProject": send("pickProject", { sessionId: sid }); break;
+      case "clearProject": send("clearProject", { sessionId: sid }); break;
+      case "params": openSessionSettings(); break;
+      case "copyInstruction": send("copyAgentInstruction", { sessionId: sid }); break;
+      case "startWait": send("startWait", { sessionId: sid }); break;
+      case "clearQueue": send("clearQueue", { scope: "session", sessionId: sid }); break;
+      case "stop": send("stop", { sessionId: sid }); break;
+      case "delete": send("deleteSession", { sessionId: sid }); break;
+      default: break;
+    }
+  }
+
   function bindEvents() {
     $("newSession").addEventListener("click", () => send("createSession"));
     $("copyInstruction").addEventListener("click", () => send("copyAgentInstruction", { sessionId: state.selectedSessionId }));
     const installMcpTop = $("installMcpTop");
     if (installMcpTop) installMcpTop.addEventListener("click", () => send("installMcp"));
+    const openWindowTop = $("openWindowTop");
+    if (openWindowTop) openWindowTop.addEventListener("click", () => send("openWindow"));
     const copyShellBtn = $("copyShellInstructionBtn");
     if (copyShellBtn) copyShellBtn.addEventListener("click", () => send("copyShellInstruction", { sessionId: state.selectedSessionId }));
     $("settingsBtn").addEventListener("click", () => { syncSettingsInputs(); openModal("settingsDialog"); });
     $("moreBtn").addEventListener("click", () => openModal("moreDialog"));
     $("send").addEventListener("click", submit);
     $("installRule").addEventListener("click", () => send("installRule"));
-    $("startWait").addEventListener("click", () => send("startWait", { sessionId: state.selectedSessionId }));
     $("runDoctor").addEventListener("click", () => send("startDoctor"));
     const installMcpBtn = $("installMcpBtn");
     if (installMcpBtn) installMcpBtn.addEventListener("click", () => send("installMcp"));
     const copyMcpBtn = $("copyMcpInstructionBtn");
     if (copyMcpBtn) copyMcpBtn.addEventListener("click", () => send("copyMcpInstruction", { sessionId: state.selectedSessionId }));
-    $("renameSession").addEventListener("click", () => send("renameSessionPrompt", { sessionId: state.selectedSessionId }));
-    $("sessionSettingsBtn").addEventListener("click", openSessionSettings);
+    const openWindowBtn = $("openWindowBtn");
+    if (openWindowBtn) openWindowBtn.addEventListener("click", () => { send("openWindow"); closeModal("moreDialog"); });
     $("saveSessionSettings").addEventListener("click", saveSessionSettings);
     $("clearSessionSettings").addEventListener("click", clearSessionSettings);
-    $("handoffBtn").addEventListener("click", openHandoff);
     $("doHandoff").addEventListener("click", submitHandoff);
     $("handoffSource").addEventListener("change", prefillHandoffContext);
     $("handoffTarget").addEventListener("change", updateHandoffHint);
-    $("deleteCurrentSession").addEventListener("click", () => send("deleteSession", { sessionId: state.selectedSessionId }));
-    $("stopLoop").addEventListener("click", () => send("stop", { sessionId: state.selectedSessionId }));
-    $("clearSelectedQueue").addEventListener("click", () => send("clearQueue", { scope: "session", sessionId: state.selectedSessionId }));
     $("clearGlobalQueue").addEventListener("click", () => send("clearQueue", { scope: "global" }));
     $("eventHistoryBtn").addEventListener("click", () => { renderEvents(); openModal("eventDialog"); });
     $("showEventsBtn").addEventListener("click", () => { renderEvents(); openModal("eventDialog"); });
@@ -639,26 +771,43 @@
     $("installPatch").addEventListener("click", () => send("installRetryPatch"));
     $("uninstallPatch").addEventListener("click", () => send("uninstallRetryPatch"));
     $("saveSettings").addEventListener("click", saveSettings);
+    const testWebhookBtn = $("testWebhookBtn");
+    if (testWebhookBtn) testWebhookBtn.addEventListener("click", () => send("testWebhook", { url: ($("setWebhookUrl").value || "").trim() }));
     $("pickFiles").addEventListener("click", () => send("pickFiles"));
+    $("pickFolders").addEventListener("click", () => send("pickFolders"));
     $("pickEditor").addEventListener("click", () => send("pickActiveEditor"));
     $("pickWorkspace").addEventListener("click", () => send("pickWorkspaceFolder"));
     $("sessionList").addEventListener("click", (event) => {
+      const closest = (sel) => (event.target && event.target.closest ? event.target.closest(sel) : null);
+      // The ⋯ button opens the per-session action menu anchored beneath it.
+      const menuBtn = closest("[data-session-menu]");
+      if (menuBtn) {
+        event.stopPropagation();
+        const rect = menuBtn.getBoundingClientRect();
+        openSessionMenu(menuBtn.dataset.sessionMenu, rect.left, rect.bottom + 4);
+        return;
+      }
+      // The inline "转接" shortcut (shown on stalled/offline cards) jumps to handoff.
+      const quick = closest("[data-quick-handoff]");
+      if (quick) {
+        event.stopPropagation();
+        selectSession(quick.dataset.quickHandoff);
+        _menuSessionId = quick.dataset.quickHandoff;
+        openHandoff();
+        return;
+      }
       // A click on the conversation-id chip copies the id (via the extension's
       // clipboard) instead of selecting the card -- one-tap, no manual typing.
-      const cidEl = event.target && event.target.closest ? event.target.closest("[data-copy-cid]") : null;
+      const cidEl = closest("[data-copy-cid]");
       if (cidEl) {
         event.stopPropagation();
         const cid = cidEl.dataset.copyCid || "";
         if (cid) send("copyText", { text: cid });
         return;
       }
-      const card = event.target && event.target.closest ? event.target.closest("[data-session-id]") : null;
+      const card = closest("[data-session-id]");
       if (!card) return;
-      state.selectedSessionId = card.dataset.sessionId;
-      renderSessions();
-      renderQueue();
-      const selected = selectedSession();
-      $("selectedSessionText").textContent = selected ? `当前会话：${selected.name}` : "当前会话：未选择";
+      selectSession(card.dataset.sessionId);
     });
     document.querySelectorAll("[data-close-modal]").forEach((button) => button.addEventListener("click", () => closeModal(button.dataset.closeModal)));
     document.querySelectorAll(".modal-layer").forEach((layer) => layer.addEventListener("click", (event) => {
@@ -668,7 +817,10 @@
       if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) submit();
     });
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") ["moreDialog", "settingsDialog", "eventDialog", "queueDialog", "timelineDialog", "sessionSettingsDialog"].forEach(closeModal);
+      if (event.key === "Escape") {
+        closeSessionMenu();
+        ["moreDialog", "settingsDialog", "eventDialog", "queueDialog", "timelineDialog", "sessionSettingsDialog", "handoffDialog"].forEach(closeModal);
+      }
     });
     window.addEventListener("paste", (event) => {
       for (const item of event.clipboardData?.items || []) {
@@ -683,6 +835,12 @@
       if (!target) return;
       const [bucket, filePath] = target.dataset.removeAttachment.split("::");
       state.draft[bucket] = state.draft[bucket].filter((value) => value !== filePath);
+      // Release the thumbnail cache entry for a removed image attachment so
+      // thumbs/thumbReq don't grow unbounded over a long session.
+      if (bucket === "image_paths") {
+        delete state.thumbs[filePath];
+        delete state.thumbReq[filePath];
+      }
       renderAttachments();
     });
     document.addEventListener("click", (event) => {
@@ -704,19 +862,61 @@
         scope: target.dataset.scope || "session",
       });
     });
-    // Workspace tools
-    const wsSummaryBtn = $("workspaceSummaryBtn");
-    if (wsSummaryBtn) wsSummaryBtn.addEventListener("click", () => send("workspaceSummary"));
-    const wsSearchBtn = $("workspaceSearchBtn");
-    if (wsSearchBtn) wsSearchBtn.addEventListener("click", () => {
-      const query = $("workspaceSearchInput")?.value?.trim();
-      if (query) send("workspaceSearch", { query, maxResults: 50 });
+
+    // Right-click a session card opens the same per-session menu (a redundant
+    // power-user shortcut that mirrors the visible ⋯ button).
+    $("sessionList").addEventListener("contextmenu", (event) => {
+      const card = event.target && event.target.closest ? event.target.closest("[data-session-id]") : null;
+      if (!card) return;
+      event.preventDefault();
+      openSessionMenu(card.dataset.sessionId, event.clientX, event.clientY);
     });
+    // Keyboard parity: Enter/Space selects, ContextMenu key / Shift+F10 opens menu.
+    $("sessionList").addEventListener("keydown", (event) => {
+      const card = event.target && event.target.closest ? event.target.closest("[data-session-id]") : null;
+      if (!card) return;
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectSession(card.dataset.sessionId);
+      } else if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+        event.preventDefault();
+        const rect = card.getBoundingClientRect();
+        openSessionMenu(card.dataset.sessionId, rect.left + 24, rect.bottom - 8);
+      }
+    });
+    const sessionMenu = $("sessionMenu");
+    if (sessionMenu) {
+      sessionMenu.addEventListener("click", (event) => {
+        const item = event.target && event.target.closest ? event.target.closest("[data-menu-action]") : null;
+        if (item) runSessionMenuAction(item.dataset.menuAction);
+      });
+      sessionMenu.addEventListener("keydown", (event) => {
+        const items = Array.from(sessionMenu.querySelectorAll(".context-menu-item"));
+        if (!items.length) return;
+        const idx = items.indexOf(document.activeElement);
+        if (event.key === "Escape") { event.preventDefault(); closeSessionMenu(); }
+        else if (event.key === "ArrowDown") { event.preventDefault(); (items[idx + 1] || items[0]).focus(); }
+        else if (event.key === "ArrowUp") { event.preventDefault(); (items[idx - 1] || items[items.length - 1]).focus(); }
+        else if (event.key === "Home") { event.preventDefault(); items[0].focus(); }
+        else if (event.key === "End") { event.preventDefault(); items[items.length - 1].focus(); }
+      });
+    }
+    // Close the menu on any outside interaction.
+    document.addEventListener("mousedown", (event) => {
+      const menu = $("sessionMenu");
+      if (!menu || menu.classList.contains("hidden")) return;
+      const insideMenu = menu.contains(event.target);
+      const onTrigger = event.target && event.target.closest ? event.target.closest("[data-session-menu]") : null;
+      if (!insideMenu && !onTrigger) closeSessionMenu();
+    });
+    window.addEventListener("blur", closeSessionMenu);
+    window.addEventListener("resize", closeSessionMenu);
+    document.addEventListener("scroll", closeSessionMenu, true);
   }
 
   window.addEventListener("message", (event) => {
     const data = event.data || {};
-    if (data.type === "filesPicked") addPaths(data.paths || []);
+    if (data.type === "filesPicked") addPaths(data.paths || [], data.kind);
     if (data.type === "pastedImageSaved") addPaths([data.path]);
     if (data.type === "thumb" && data.path) {
       state.thumbs[data.path] = data.dataUrl;
@@ -737,23 +937,24 @@
     if (data.type === "sessionCreated" && data.session) {
       state.selectedSessionId = data.session.id;
     }
+    // The injected workbench helper reported which session the active Cursor
+    // conversation belongs to (via the loopback channel). Follow it so switching
+    // conversations auto-selects the matching session — no manual click, no
+    // sending to the wrong session.
+    if (data.type === "selectSession" && data.sessionId) {
+      if (state.selectedSessionId !== data.sessionId && state.sessions.some((s) => s.id === data.sessionId)) {
+        state.selectedSessionId = data.sessionId;
+        renderSessions();
+        renderQueue();
+        const selected = selectedSession();
+        setTextIfChanged($("selectedSessionText"), selected ? `当前会话：${selected.name}` : "当前会话：未选择");
+      }
+    }
     if (data.type === "status") renderStatus(data.status || {});
     if (data.type === "event") {
       state.events.unshift({ at: data.at, text: compactText(data.text, 260) });
       if (state.events.length > 100) state.events.length = 100;
       renderEvents();
-    }
-    if (data.type === "workspaceFiles") {
-      state.workspaceFiles = data.files || [];
-    }
-    if (data.type === "workspaceFileContent") {
-      state.workspaceFileContent = data;
-    }
-    if (data.type === "workspaceSearchResults") {
-      state.workspaceSearchResults = data;
-    }
-    if (data.type === "workspaceSummary") {
-      state.workspaceSummary = data.summary || "";
     }
   });
 

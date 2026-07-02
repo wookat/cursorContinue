@@ -2,7 +2,7 @@
   "name": "local-continue-assistant",
   "displayName": "续聊助手",
   "description": "Cursor 续聊助手：队列、握手、状态反馈、附件输入、图片粘贴和官方聊天框重试助手。",
-  "version": "1.0.1",
+  "version": "1.3.1",
   "publisher": "local-codex",
   "license": "MIT",
   "engines": {
@@ -47,6 +47,10 @@
         "title": "续聊助手：打开面板"
       },
       {
+        "command": "localContinue.openWindow",
+        "title": "续聊助手：在独立窗口打开面板"
+      },
+      {
         "command": "localContinue.installRule",
         "title": "续聊助手：给当前项目安装规则"
       },
@@ -77,10 +81,6 @@
       {
         "command": "localContinue.uninstallRetryPatch",
         "title": "续聊助手：卸载官方聊天框重试助手"
-      },
-      {
-        "command": "localContinue.workspaceSummary",
-        "title": "续聊助手：生成工作区摘要"
       }
     ]
   },
@@ -94,11 +94,26 @@
     "extension.js",
     "package.json",
     "README.md",
-    "LICENSE.txt",
+    "LICENSE",
     "media/icon.svg",
     "media/panel.css",
     "media/panel.js",
     "media/official-retry-helper.js",
+    "src/fs-utils.js",
+    "src/local-channel.js",
+    "src/paths.js",
+    "src/settings.js",
+    "src/sessions.js",
+    "src/queue.js",
+    "src/session-status.js",
+    "src/history.js",
+    "src/image-utils.js",
+    "src/instruction-builder.js",
+    "src/pickers.js",
+    "src/retry-patch.js",
+    "src/panel-html.js",
+    "src/panel-provider.js",
+    "runtime/shared.js",
     "runtime/instruction.js",
     "runtime/mcp-server.js",
     "runtime/cutc_rules_template.mdc"

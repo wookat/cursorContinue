@@ -22,7 +22,7 @@ const crypto = require("crypto");
 const inst = require("./instruction.js");
 
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = { name: "local-continue-续聊助手", version: "1.0.1" };
+const SERVER_INFO = { name: "local-continue-续聊助手", version: "1.2.0" };
 // Cursor hard-cuts an MCP tool call at ~60 min (-32001). Return a KEEPALIVE_NOOP a
 // bit before that so the agent re-invokes and the request never hard-fails.
 const DEFAULT_SOFT_TIMEOUT_MS = 3300 * 1000;
@@ -54,11 +54,62 @@ function keepaliveText(sessionId) {
 当前没有新的用户指令（已等待较久）。请不要修改项目，也不要总结，只需要**立即再次调用 wait_for_instruction 工具**（session_id="${sessionId}"）继续等待下一条指令，保持本对话循环。`;
 }
 
+// Appended to the *content* of every real instruction so the agent is re-told,
+// in-band on every single turn, to re-enter the loop after finishing. The
+// one-off start instruction is easy to "forget" many turns later; this in-band
+// reminder is the most reliable guard against a model ending its turn instead of
+// calling wait_for_instruction again.
+function loopReminder(sessionId) {
+  return `
+
+────────
+[续聊助手·循环提醒] 以上是本轮要执行的用户指令。**执行完成后，请立即再次调用 wait_for_instruction（session_id="${sessionId}"）** 等待下一条指令；是否结束由用户的 stop 决定，不由你决定——除非收到 stop，否则不要结束本轮，也不要停下来问“是否继续”。`;
+}
+
 function sessionBusyText(sessionId, ownerPid) {
   const pid = ownerPid ? `pid ${ownerPid}` : "另一个进程";
   return `SESSION_BUSY:
 会话 ${sessionId} 已有一个活动的等待者（${pid}），通常是另一个对话也在用同一个 session_id（another instruction waiter is already active for this session）。
 请不要反复重试抢锁；在续聊助手面板为本对话新建一个会话并用它的 session_id，或改用一个唯一的 session_id，然后再调用 wait_for_instruction。`;
+}
+
+// --- Working-presence heartbeat (MCP mode) -----------------------------------
+// The shell runtime spawns a detached beacon that watches the agent terminal's
+// PID so the panel can tell "working" from "interrupted" during the work gap
+// between two waits. The MCP server has no per-conversation terminal to watch --
+// it is one window-level process shared by every session -- so that beacon never
+// runs, and the panel used to fall back to a time threshold that flips a healthy
+// long task to "stalled/interrupted" after ~5 min. Instead, while this process is
+// alive we heartbeat presence.json for a session from the moment we hand it an
+// instruction (agent starts working) until it re-enters wait or the process dies.
+// So a long turn stays "working", and only the window/process actually going away
+// makes presence go stale -> "interrupted". (A single conversation interrupted
+// while its window stays open can't be detected over MCP; that's inherent.)
+const MCP_PRESENCE_INTERVAL_MS = 4000;
+const workingPresence = new Map(); // sessionId -> interval timer
+
+function startWorkingPresence(session) {
+  stopWorkingPresence(session.sessionId);
+  const write = () => session.writeJsonBestEffort(session.presencePath, {
+    beacon: true,
+    mode: "mcp",
+    pid: process.pid,
+    heartbeat_ms: inst.nowMs(),
+    heartbeat_at: inst.isoNow(),
+    interval_ms: MCP_PRESENCE_INTERVAL_MS,
+  });
+  write();
+  const timer = setInterval(write, MCP_PRESENCE_INTERVAL_MS);
+  if (timer.unref) timer.unref();
+  workingPresence.set(session.sessionId, timer);
+}
+
+function stopWorkingPresence(sessionId) {
+  const timer = workingPresence.get(sessionId);
+  if (timer) {
+    clearInterval(timer);
+    workingPresence.delete(sessionId);
+  }
 }
 
 // Block on this session's queue (and the global idle-first queue) until an item
@@ -69,13 +120,20 @@ async function waitForInstructionMcp(project, sessionId, opts) {
   project.registerSession(sessionId);
   const session = project.session(sessionId);
   const runId = crypto.randomUUID().replace(/-/g, "");
-  if (opts.report) session.recordResult(opts.report, opts.reportStatus || "done", runId);
+  if (opts.report) {
+    session.recordResult(opts.report, opts.reportStatus || "done", runId);
+    // Task finished + re-entering the loop -> fire the opt-in result webhook.
+    inst.notifyWebhookResult(project, sessionId, opts.report, opts.reportStatus || "done", { transport: "mcp" });
+  }
 
   const [acquired, owner] = session.acquireWaiter(runId);
   if (!acquired) {
     session.writeStatus(runId, "busy", { transport: "mcp", last_error: "another waiter is already active", active_waiter: owner });
-    return sessionBusyText(sessionId, owner && owner.pid);
+    return { kind: "session_busy", text: sessionBusyText(sessionId, owner && owner.pid) };
   }
+  // The agent is back to waiting, so its heartbeat again drives online state --
+  // stop the working-presence heartbeat started when we handed out the last item.
+  stopWorkingPresence(sessionId);
 
   const startedAtMs = inst.nowMs();
   const keepaliveDeadline = SOFT_TIMEOUT_MS > 0 ? Date.now() + SOFT_TIMEOUT_MS : null;
@@ -105,7 +163,10 @@ async function waitForInstructionMcp(project, sessionId, opts) {
     for (;;) {
       if (opts.isCancelled && opts.isCancelled()) {
         session.writeStatus(runId, "cancelled", { transport: "mcp", uptime_ms: inst.nowMs() - startedAtMs });
-        return { cancelled: true };
+        return {
+          kind: "cancelled",
+          text: `本次等待被取消（通常是客户端超时或界面切换，不是错误）。请立即再次调用 wait_for_instruction（session_id="${sessionId}"）继续等待下一条指令，不要结束本轮。`,
+        };
       }
       const now = Date.now();
       if (now - lastHeartbeat >= heartbeatInterval) {
@@ -132,7 +193,11 @@ async function waitForInstructionMcp(project, sessionId, opts) {
       }
       if (item) {
         const payload = inst.normalizePayload(item);
-        const rendered = inst.renderPayload(payload);
+        // stateDir is <workspace>/.cursor/local-continue-state -> workspace root is two levels up.
+        const wsRoot = path.dirname(path.dirname(project.stateDir));
+        const rendered = inst.renderPayload(payload, wsRoot);
+        // Pin the agent to this session's project directory (if configured).
+        const scoped = inst.applySessionScope(project, sessionId, rendered);
         session.writeStatus(runId, "received", {
           transport: "mcp",
           last_ack_id: item.id,
@@ -141,12 +206,15 @@ async function waitForInstructionMcp(project, sessionId, opts) {
           uptime_ms: inst.nowMs() - startedAtMs,
         });
         session.appendHistory({ type: "received", id: item.id, source_queue: sourceQueue, transport: "mcp", session_id: sessionId, run_id: runId, message_preview: rendered.slice(0, 160), at: inst.isoNow() });
-        return { text: rendered };
+        // Hand-off: the agent is about to work, so drive the panel's "working"
+        // state from a presence heartbeat until it re-enters wait (see above).
+        if (rendered !== "stop") startWorkingPresence(session);
+        return { kind: rendered === "stop" ? "stop" : "instruction", text: scoped };
       }
 
       if (keepaliveDeadline !== null && Date.now() >= keepaliveDeadline) {
         session.writeStatus(runId, "keepalive", { transport: "mcp", last_message_preview: "KEEPALIVE_NOOP", uptime_ms: inst.nowMs() - startedAtMs });
-        return { text: keepaliveText(sessionId) };
+        return { kind: "keepalive", text: keepaliveText(sessionId) };
       }
 
       let waitMs = MAX_POLL_MS;
@@ -162,11 +230,34 @@ async function waitForInstructionMcp(project, sessionId, opts) {
 }
 
 // --- MCP JSON-RPC over stdio -------------------------------------------------
+// The structured shape wait_for_instruction returns alongside its text, so the
+// agent can branch on `kind` instead of fragile string-prefix matching of the
+// text (KEEPALIVE_NOOP: / SESSION_BUSY: ...). Text is kept for back-compat.
+const WAIT_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: {
+      type: "string",
+      enum: ["instruction", "keepalive", "session_busy", "stop", "cancelled", "error"],
+      description: "指令类型：instruction=执行它；keepalive=立即再次调用本工具；session_busy=换唯一 session_id；stop=结束循环；cancelled=等待被取消（应重新调用）；error=临时出错（应重新调用）。",
+    },
+    session_id: { type: "string", description: "本次等待所属的会话 ID。" },
+    text: { type: "string", description: "渲染后的指令/提示全文（instruction 时为纯用户指令）。" },
+    next_action: {
+      type: "string",
+      enum: ["call_wait_for_instruction", "stop", "use_unique_session_id"],
+      description: "下一步动作：call_wait_for_instruction=处理完后立即再次调用本工具（instruction/keepalive/cancelled/error 都是它）；stop=结束循环；use_unique_session_id=换唯一 session_id 再调用。",
+    },
+  },
+  required: ["kind", "text", "next_action"],
+};
+
 const TOOLS = [
   {
     name: "wait_for_instruction",
+    title: "等待下一条指令",
     description:
-      "续聊助手 bridge 循环的核心：阻塞直到面板下发本会话的下一条指令再返回。用法：每完成一轮任务后就再次调用本工具（可带 report 反馈刚做完的事）。返回可能是：一条用户指令（直接执行）、KEEPALIVE_NOOP（立即再次调用本工具）、SESSION_BUSY（换唯一 session_id）、或 stop（结束循环）。这是 MCP 工具调用，会被原生阻塞等待，不会被放到后台。",
+      "续聊助手 bridge 循环的核心：阻塞直到面板下发本会话的下一条指令再返回。用法：每完成一轮任务后就再次调用本工具（可带 report 反馈刚做完的事）。返回结构化 kind 字段（优先判断它）：instruction=直接执行、keepalive=立即再次调用本工具、session_busy=换唯一 session_id、stop=结束循环。这是 MCP 工具调用，会被原生阻塞等待，不会被放到后台。",
     inputSchema: {
       type: "object",
       properties: {
@@ -175,9 +266,17 @@ const TOOLS = [
         report_status: { type: "string", enum: ["done", "need_input", "error"], description: "report 的状态。" },
       },
     },
+    outputSchema: WAIT_OUTPUT_SCHEMA,
+    annotations: {
+      title: "等待下一条指令",
+      readOnlyHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
   },
   {
     name: "report_result",
+    title: "上报结果",
     description: "把本会话的一句话结果/状态上报给面板（不进入等待）。",
     inputSchema: {
       type: "object",
@@ -188,6 +287,40 @@ const TOOLS = [
       },
       required: ["summary"],
     },
+    annotations: {
+      title: "上报结果",
+      readOnlyHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "get_status",
+    title: "查看会话状态",
+    description: "只读查看续聊助手所有会话的状态摘要（在线/队列长度/最近消费），供 Agent 自诊断或转接决策，不进入等待。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "可选：只关心某个会话时传它；不传则返回全部。" },
+      },
+    },
+    annotations: {
+      title: "查看会话状态",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+];
+
+// Read-only resource: the same status summary get_status returns, exposed as an
+// MCP resource so a client/agent can read it without spending a tool call.
+const RESOURCES = [
+  {
+    uri: "local-continue://sessions",
+    name: "续聊助手会话状态",
+    description: "所有会话的在线状态、队列长度与最近消费摘要（只读 JSON）。",
+    mimeType: "application/json",
   },
 ];
 
@@ -212,6 +345,22 @@ function textResult(text, isError) {
   return result;
 }
 
+function toolResult(text, opts = {}) {
+  const result = { content: [{ type: "text", text: String(text) }] };
+  if (opts.isError) result.isError = true;
+  if (opts.structured) result.structuredContent = opts.structured;
+  return result;
+}
+
+// The status summary get_status / the sessions resource return. Optionally
+// narrowed to a single session.
+function buildStatus(sessionId) {
+  const summary = project.statusSummary();
+  if (!sessionId) return summary;
+  const id = inst.safeSessionId(sessionId);
+  return { ...summary, sessions: (summary.sessions || []).filter((s) => s.id === id) };
+}
+
 async function handleToolCall(id, params) {
   const name = params && params.name;
   const args = (params && params.arguments) || {};
@@ -220,21 +369,45 @@ async function handleToolCall(id, params) {
     if (!summary) return respond(id, textResult("summary 不能为空。", true));
     const session = project.session(args.session_id || "agent-1");
     session.recordResult(summary, args.status || "done", null);
+    inst.notifyWebhookResult(project, args.session_id || "agent-1", summary, args.status || "done", { transport: "mcp" });
     return respond(id, textResult("已上报。"));
   }
+  if (name === "get_status") {
+    const status = buildStatus(args.session_id);
+    return respond(id, toolResult(JSON.stringify(status, null, 2), { structured: status }));
+  }
   if (name === "wait_for_instruction") {
+    const sessionId = inst.safeSessionId(args.session_id || "agent-1");
     const state = { cancelled: false };
     inflight.set(id, state);
     try {
-      const outcome = await waitForInstructionMcp(project, args.session_id || "agent-1", {
+      const outcome = await waitForInstructionMcp(project, sessionId, {
         report: args.report || null,
         reportStatus: args.report_status || "done",
         isCancelled: () => state.cancelled,
       });
-      if (outcome && outcome.cancelled) return respond(id, textResult("等待已取消。", true));
-      return respond(id, textResult(outcome.text));
+      const kind = outcome.kind || "instruction";
+      const nextAction = kind === "stop" ? "stop"
+        : kind === "session_busy" ? "use_unique_session_id"
+        : "call_wait_for_instruction";
+      // Re-append the loop reminder to an actual instruction's content so the
+      // agent is told, in-band every turn, to call wait_for_instruction again
+      // after finishing. structuredContent.text stays the clean instruction.
+      // Nothing here is isError: keepalive/cancelled/session_busy/stop are all
+      // normal control signals -- marking any as an error tempts the model to end
+      // the turn instead of looping, which is the very bug we're fixing.
+      const contentText = kind === "instruction" ? outcome.text + loopReminder(sessionId) : outcome.text;
+      return respond(id, toolResult(contentText, {
+        structured: { kind, session_id: sessionId, text: outcome.text, next_action: nextAction },
+      }));
     } catch (error) {
-      return respond(id, textResult(`等待出错：${error && error.message ? error.message : error}`, true));
+      const detail = error && error.message ? error.message : String(error);
+      // Even a genuine error must steer the agent back into the loop rather than
+      // let it stop; surface it (isError) but tell it to retry.
+      return respond(id, toolResult(
+        `等待出错：${detail}。这通常是临时问题，请再次调用 wait_for_instruction（session_id="${sessionId}"）重试，不要结束本轮。`,
+        { isError: true, structured: { kind: "error", session_id: sessionId, text: detail, next_action: "call_wait_for_instruction" } },
+      ));
     } finally {
       inflight.delete(id);
     }
@@ -260,21 +433,44 @@ function handleMessage(message) {
     const requested = params && params.protocolVersion;
     return respond(id, {
       protocolVersion: requested || PROTOCOL_VERSION,
-      capabilities: { tools: { listChanged: false } },
+      capabilities: {
+        tools: { listChanged: false },
+        resources: { listChanged: false, subscribe: false },
+      },
       serverInfo: SERVER_INFO,
     });
   }
   if (method === "ping") return respond(id, {});
   if (method === "tools/list") return respond(id, { tools: TOOLS });
   if (method === "tools/call") { handleToolCall(id, params); return; }
+  if (method === "resources/list") return respond(id, { resources: RESOURCES });
+  if (method === "resources/read") {
+    const uri = params && params.uri;
+    if (uri === "local-continue://sessions") {
+      const status = buildStatus(null);
+      return respond(id, { contents: [{ uri, mimeType: "application/json", text: JSON.stringify(status, null, 2) }] });
+    }
+    return respondError(id, -32602, `unknown resource: ${uri}`);
+  }
   return respondError(id, -32601, `method not found: ${method}`);
 }
 
 function main() {
   process.stdin.setEncoding("utf8");
   let buffer = "";
+  // Cap the stdin buffer so a malformed/malicious peer can't exhaust memory by
+  // sending an extremely long line without a newline. 10MB is far above any
+  // legitimate JSON-RPC message for this server.
+  const MAX_BUFFER = 10 * 1024 * 1024;
   process.stdin.on("data", (chunk) => {
     buffer += chunk;
+    if (buffer.length > MAX_BUFFER) {
+      // Drop the oversized buffer and log; the peer will see a broken stream
+      // and reconnect, which is safer than OOM-ing the MCP process.
+      process.stderr.write("mcp-server: stdin buffer exceeded 10MB, resetting\n");
+      buffer = "";
+      return;
+    }
     let nl;
     while ((nl = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, nl).trim();

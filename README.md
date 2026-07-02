@@ -2,8 +2,9 @@
 
 这是一个 Cursor 续聊插件。它使用项目内的本地队列，通过 MCP 工具 `wait_for_instruction`（推荐）或 shell 命令 `instruction.js wait`（兜底）桥接 Cursor 官方 Agent 对话，让你可以在插件面板里继续发送指令、引用文件、粘贴图片，并管理多个并行 Agent 会话。
 
-## 1.0.1 主要能力
+## 1.1.0 主要能力
 
+- **独立窗口 / 多窗口面板**：面板不再只能停靠在底部——顶部「⧉ 独立窗口」（或命令「续聊助手：在独立窗口打开面板」）会在编辑器区新开一个独立面板实例并自动「移入新窗口」，可拖到第二屏。底部面板与任意多个独立窗口全部挂在同一套广播状态上，共享同一份文件队列，实时同步，天然适合多窗口、多 Agent 并行管理；某个窗口关闭只回收自身，不影响其余。
 - 多会话：每个 Cursor 官方 Agent 对话使用一个独立 `session-id`。
 - 多队列：支持 `sessions/<session-id>/queue.json` 和 `global_queue.json`。
 - 保活：等待超过保活间隔时返回 `KEEPALIVE_NOOP`，提醒 Agent 重新进入 wait，不让对话长时间无输出而中断。
@@ -17,8 +18,10 @@
 - **实时执行状态 + 在线信标（beacon）**：`wait` 会透明地拉起一个与 Agent 终端共存亡的轻量 presence 信标进程，它在 Agent 干活（两次 wait 之间）也持续写心跳，并在启动它的 shell 消失（终端关闭 / 对话被打断）时自动退出。面板据此把会话显示为"执行中"（蓝色脉冲 + 已执行时长）或"已中断 · 终端/对话已关闭"（红色脉冲），中断在约一个心跳间隔内（数秒）被发现，而非误显示离线或干等时间阈值。信标缺失时回退到"执行超时判定秒数"的时间阈值推断。
 - 队列治理：支持单会话队列上限、空闲优先队列上限、查看、移除、清空。
 - 中文 UI：设置弹窗、更多操作、执行记录、队列弹窗都在独立弹窗中显示。
-- 附件：支持引用文件、当前编辑器、工作区目录和粘贴图片。
+- 附件：支持引用文件、**引用文件夹**（渲染封顶目录树，跳过 `node_modules`/`.git` 等重目录）、当前编辑器、工作区目录和粘贴图片。
+- **项目目录限定（多项目工作区作用域）**：一个工作区常并存多个项目；会话卡片 ⋯ 菜单「设置项目目录…」可把某会话锁定到某个子项目目录，之后该会话每条指令前都会自动注入「[项目范围]」提示，让 Agent 只在该目录内开发；卡片上以 📁 芯片显示当前限定，shell 与 MCP 两种传输一致生效。
 - 可选本机重试补丁：用于 Cursor 本机官方聊天框发送失败时的自动重试，不作用于 SSH 服务器。
+- **对话框会话序号 + 切对话自动选中（本机通信通道）**：装了重试补丁后，注入图标旁会显示当前对话所属的会话序号（`#N`，扫描对话里粘贴的"当前会话 ID：agent-X"）；配合重新引入的**极简本机回环通道**（`127.0.0.1`，仅同步"活动会话"，非旧的长轮询 Bridge），切换到哪个对话，面板就自动选中对应会话，避免把指令发错会话。通道按端口范围探测 + 会话归属路由，天然支持多窗口；被渲染进程 CSP 拦截时自动降级（序号仍显示）。
 - fs.watch 事件驱动：队列文件变化即时通知，无需依赖轮询；自适应退避策略在空闲时降低唤醒频率。
 - 性能优化：stat 签名缓存、DOM diff 渲染、CSS containment、正则预编译、紧凑 JSON 序列化等。
 - **强规则模板**：`alwaysApply: true`，包含 Shell 超时行为说明、Cursor 超时信号识别（`Waited briefly` / `Will resume`）、禁止短语、系统目录保护等硬性指令。
@@ -27,23 +30,49 @@
 
 ```text
 cursorContinue/
-├── extension.js              # 插件主代码
-├── package.json              # 插件配置
+├── extension.js              # 扩展入口：注册命令、启动 PanelProvider
+├── package.json              # 扩展配置
 ├── package-lock.json         # 依赖锁定
 ├── media/                    # 插件 UI 资源
 │   ├── icon.svg
 │   ├── panel.css
 │   ├── panel.js
 │   └── official-retry-helper.js
+├── src/                      # 扩展模块（高内聚、低耦合）
+│   ├── fs-utils.js           # 底层 IO：原子 JSON/JSONL、目录锁
+│   ├── local-channel.js      # 本机回环通道（活动会话同步）
+│   ├── paths.js              # 路径解析、运行时缓存、命令构建
+│   ├── settings.js           # 设置读写
+│   ├── sessions.js           # 会话索引 CRUD
+│   ├── queue.js              # 队列操作 CRUD
+│   ├── session-status.js     # 会话状态摘要与调度分发
+│   ├── history.js            # JSONL 历史记录读取
+│   ├── image-utils.js        # 图片粘贴/预览/清理
+│   ├── instruction-builder.js # 指令构建、MCP 配置、终端、规则
+│   ├── pickers.js            # 文件/文件夹选择器
+│   ├── retry-patch.js        # Retry Patch 系统（P1/P2/P3 + UAC 提权）
+│   ├── panel-html.js         # Webview HTML 模板
+│   └── panel-provider.js     # PanelProvider 类 + 状态聚合
 ├── runtime/                  # Agent 运行时脚本
+│   ├── shared.js             # 运行时与扩展共用的常量/数据契约/默认设置（单一真相源）
 │   ├── instruction.js        # shell 兜底运行时
 │   ├── mcp-server.js         # MCP 传输层（wait_for_instruction 工具，默认）
 │   └── cutc_rules_template.mdc
 ├── dist/                     # 生成的发布包（不提交 git）
 ├── reference/                # 参考插件包（不提交 git）
-├── LICENSE.txt
+├── LICENSE
 ├── README.md
 └── .gitignore
+```
+
+### 模块依赖层次
+
+```text
+shared.js → fs-utils.js → paths.js → settings.js
+  → sessions.js → queue.js → session-status.js
+  → history.js / image-utils.js / pickers.js
+  → instruction-builder.js / retry-patch.js
+  → panel-html.js → panel-provider.js → extension.js
 ```
 
 ## 安装
@@ -127,6 +156,64 @@ npm run package
 打包后的 `.vsix` 会生成在项目根目录，可移入 `dist/` 目录保存。`reference/` 目录存放参考插件包供分析用，两者均不提交 git。
 
 ## 更新日志
+
+### 1.3.1
+
+安全与健壮性加固（不改 UI、不改协议，向后兼容）：
+
+- **shell 命令注入加固**：`src/paths.js` 的 `quoteArg` 增加对 `$` 和 `` ` `` 的转义；`runtimeWaitCommand` 的数值参数（`keepalive`/`timeout`/`poll`）全部加引号。`runtime/instruction.js` 的 `buildRerunCmd` 引入统一转义函数，`sessionId`/`report`/`reportStatus` 全部加引号并转义 `"`/`$`/`` ` ``，消除 Agent 重新执行命令时的注入风险。
+- **轮询调度竞态修复**：`src/session-status.js` 的 `chooseRoundRobinSession` 用 `withDirectoryLock` 包裹整个 read-modify-write，防止并发 dispatch 导致 `roundRobinIndex` 跳号或重复选同一会话。
+- **文件渲染工作区边界标记**：`runtime/instruction.js` 的 `renderFileContext`/`renderFolderContext`/`renderImageContext` 接受 `workspaceRoot` 参数，路径越界时在输出中加 `[注意：该路径位于工作区目录之外]` 标记；`renderPayload` 及 shell/MCP 两个调用处均传入 workspaceRoot。
+- **CSP nonce 加固**：`src/panel-html.js` 的 nonce 从 `Date.now()` 改为 `crypto.randomBytes(16).toString("base64")`，不可猜测。
+- **目录锁 owner 写入失败处理**：`src/fs-utils.js` 的 `withDirectoryLock` 在 owner 文件写入失败时释放锁并重试，不再静默继续（防止锁被误判无主而遭抢占）。
+- **`trimJsonl` 流式化**：`src/fs-utils.js` 与 `runtime/instruction.js` 的 `trimJsonl` 改为从尾部读块（封顶 8MB），仅在尾部块行数不足时才回退全量读，避免大历史文件撑内存。
+- **`getAllSessions` 短 TTL 缓存**：`src/session-status.js` 加 200ms TTL + 签名缓存，同一次状态推送的多次调用合并为一轮 I/O。
+- **panel.js 内存治理**：附件移除时清理对应 `thumbs`/`thumbReq` 条目；`renderAttachments` 时若 `thumbs` 超 80 条自动清理不在当前附件列表里的条目；`inlineQueueOpen` 按钮从 `addEventListener` 改为 `onclick` 赋值，消除重复渲染时的监听器堆叠。
+- **symlink 环检测**：`runtime/instruction.js` 的 `renderFolderContext` 用 `realpath` + `visited` Set 检测 symlink 环，遇环时标记 `[循环已跳过]` 并退出。
+- **settings 归一化去重**：`src/settings.js` 提取 `normalizeSettings()` 函数，`readSettings`/`saveSettings` 共用，消除 15 行重复逻辑。
+- **local-channel token 防御**：`src/local-channel.js` 的 token 校验改为 `!this.token || ...`，空 token 时 fail closed（403）。
+- **JSON 缓存 LRU 淘汰**：`src/fs-utils.js` 的 `_jsonCache` 加 100 条上限 + LRU touch。
+- **多根工作区支持**：`src/paths.js` 的 `getWorkspaceRoot` 多根工作区时优先取包含当前活动编辑器文件的文件夹。
+- **项目目录校验**：`src/sessions.js` 的 `setSessionProject` 校验路径解析后是否在 `workspaceRoot` 之内，越界抛错。
+- **MCP stdin 上限**：`runtime/mcp-server.js` 的 stdin buffer 加 10MB 上限，超限重置并告警，防 OOM。
+- **命令面板会话选择**：`extension.js` 的 `copyAgentInstruction`/`startWait`/`sendInstruction`/`stop` 四个命令改为先 QuickPick 选会话，不再硬编码 `agent-1`。
+- 生效方式：重新打包并重装插件后**完全重启 Cursor**。
+
+### 1.3.0
+
+模块化重构 + 独立窗口 / 多窗口面板（多 Agent 管理地基）：
+
+- **模块化重构（高内聚、低耦合）**：将 `extension.js`（~2000 行）按职责拆分为 13 个独立模块（`src/paths.js` → `src/panel-provider.js`），`extension.js` 精简为 53 行入口，仅负责注册命令和启动 `PanelProvider`。依赖层次清晰：`shared.js → fs-utils → paths → settings → sessions → queue → session-status → history / image-utils / pickers → instruction-builder / retry-patch → panel-html → panel-provider → extension`。所有模块通过 `node --check` 验证，`package.json` files 数组已包含全部 `src/*.js`。
+
+- **面板从"单 webview"升级为"多 webview 广播"**：`PanelProvider` 过去只持有一个 `this.view`（底部 `WebviewViewProvider`），所有推送、可见性判断、watcher/timer 都绑死这一个实例，导致面板无法脱离底部停靠区。现改为维护一个 `clients` 集合，把"给某个 webview 挂 HTML + 消息处理 + 状态推送"抽成 `attachWebview(webview, getVisible)`，`reply()` 广播给所有在线 webview，`postStatus`/`scheduleNext`/`onWatchEvent`/`onActiveSession` 改用"任一可见 (`anyVisible`)"与"集合非空"判断；`detachClient` 只在最后一个 webview 关闭时才回收 fs.watch / 定时器 / 回环通道。底部面板行为完全向后兼容。
+- **新增「⧉ 独立窗口」**：顶部工具栏与「更多 → 视图 / 窗口」都可一键 `createWebviewPanel`（编辑器标签页，`retainContextWhenHidden`），随后自动执行 Cursor 原生 `workbench.action.moveEditorToNewWindow` 把它浮出为独立 OS 窗口（不支持时优雅退化为可手动拖出的编辑器标签页）。**零新进程**：独立窗口只是同一个扩展宿主里的又一个 webview，渲染同一份广播状态——正是此前评审里相对"本地服务 + 真独立 App（方案③）"更被推荐的"原生 WebviewPanel + 移入新窗口（方案②）"。
+- **多窗口天然同步**：所有会话/队列/状态本就落在 `.cursor/local-continue-state/`，多个窗口经各自 fs.watch 刷新，本就一致；配合本机回环通道的按会话归属路由，多窗口下"切对话→面板跟随选中"依旧生效。
+- 新增命令：`localContinue.openWindow`（续聊助手：在独立窗口打开面板）。
+- 生效方式：重新打包并重装插件后**完全重启 Cursor**。
+
+### 1.2.0
+
+技术债清理 + MCP 能力补齐（默认传输）：
+
+- **移除遗留/死代码（不再兼容旧版）**：① 删掉"工作区工具"半成品功能——面板的"生成工作区摘要/搜索"结果只存不显、`workspaceListFiles`/`workspaceReadFile` 从不被调用，整套 `WorkspaceTools` 类（约 190 行）+ 面板按钮/回复处理 + `localContinue.workspaceSummary` 命令一并移除（bridge 模式下 Agent 本就有 Cursor 原生的文件读取/搜索能力）；② 删掉从未被使用的 `imageMaxDimension` 空设置；③ 删掉 `getBridgeStatus` 里恒为空的 `includeHistory`/`history` 死分支。
+- **循环可靠性：修复"完成一轮后有时没进入等待"**：多管齐下。① 每条下发的指令在工具返回文本里就地追加**循环提醒**（写明"完成后立即再次调用 wait_for_instruction、除非 stop 否则不要结束"），每轮都提醒而非只在启动指令里说一次；② 结构化返回新增 `next_action` 字段（`call_wait_for_instruction`/`stop`/`use_unique_session_id`），Agent 按它判断下一步；③ `cancelled` 不再标成错误结果、并改为引导重新调用（客户端超时/切界面导致的取消常让模型误当失败而收尾）；④ 真异常也引导重试而非终止；⑤ 启动指令与规则模板补上"任务完成不是结束循环的理由"的硬性措辞。
+- **单一真相源 `runtime/shared.js`（消除历史漂移）**：`extension.js` 与 `runtime/instruction.js` 过去各自维护一份队列/负载数据契约、`DEFAULT_SETTINGS` 与瞬态 fs 错误集，且已经开始漂移（扩展侧缺 `ENFILE/EMFILE`、少两个默认键，两版 `normalizePayload`/`makeQueueItem` 在 null/undefined 与 id 格式上不一致）。现把这些**无 IO 副作用的常量 + 纯契约函数**抽到 `shared.js`，两侧统一 `require`，从根上杜绝再次漂移；各自的 IO/锁缓存仍留在本地（锁语义 mkdir + owner token 两侧保持一致，已加交叉引用注释）。
+- **MCP 模式补齐 presence 心跳（修复长任务误判"已中断"）**：shell 运行时靠 detached beacon 监视终端 PID 来区分"执行中/已中断"，但 MCP 是窗口级共享进程、没有可监视的对话终端，于是面板过去只能退回时间阈值——任何一轮 Agent 干活超过约 5 分钟就被误标成"已中断·执行超时"。现由 MCP 服务器在"交出指令→下次 wait 到来"期间为该会话持续写 `presence.json` 心跳：长任务稳定显示"执行中"，只有窗口/进程真正消失才变陈旧 →"已中断"。
+- **`wait_for_instruction` 结构化输出**：新增 `outputSchema` 与 `structuredContent.kind`（`instruction`/`keepalive`/`session_busy`/`stop`/`cancelled`），Agent 可按 `kind` 分支而非脆弱地匹配 `KEEPALIVE_NOOP:`/`SESSION_BUSY:` 文本前缀（文本保留兼容）。
+- **用足 MCP 能力面**：三个工具补齐 `title` 与 `annotations`（`readOnlyHint`/`idempotentHint`/`openWorldHint`）；新增只读工具 `get_status`（Agent 自诊断/转接决策）与只读资源 `local-continue://sessions`（`resources/list` + `resources/read`）。
+- **清理 doctor 的 Python 遗留**：Python 运行时 1.0.1 已删除，doctor 不再对 Python 冷启动打基准/给出无对应选项的建议，聚焦 Node + 状态目录可写性。
+- **引用文件夹 + 项目目录限定（多项目工作区）**：① 附件新增「引用文件夹」，把整个文件夹作为**封顶目录树**（跳过 `node_modules`/`.git` 等重目录，深 4 层 / 400 条）注入指令上下文，附件与队列标签同步显示文件夹，「引用工作区」按钮也升级为递归树；② 会话可经卡片 ⋯ 菜单「设置项目目录…」锁定到工作区内某个**子项目目录**，运行时在每条指令前自动加「[项目范围]」提示，shell 与 MCP 两传输一致生效，卡片以 📁 芯片显示当前限定，可随时「取消项目目录限定」——解决"一个工作区含多个项目、需把某会话固定在某项目内开发/操作"的场景。
+- 生效方式：重新打包并重装插件后**完全重启 Cursor**（让新 MCP 服务器与运行时脚本生效）。
+
+### 1.1.0
+
+对话框会话序号 + 切对话自动选中（重新引入本机通信通道）：
+
+- **重新引入本机通信通道（`LocalChannel`）**：1.0.1 移除 HTTP Bridge 后注入脚本与面板失去通信通道，本版按需重新引入一个**极简回环 HTTP 通道**（`127.0.0.1`），仅承载"活动会话同步"这一件事（不是旧的长轮询指令传输，那块由 MCP 覆盖）。端口在 `[48090, 48120)` 内探测占用，每个 Cursor 窗口各占一个；注入脚本通过 `/lca/ping?session=` 做**会话归属路由**，天然支持多窗口；`/lca/active` 用注入到补丁里的 token 鉴权。
+- **① 对话框注入图标显示会话序号**：注入的图标旁新增 `#N` 芯片，扫描当前对话里粘贴的"当前会话 ID：agent-X"得出序号，让你一眼看清当前对话属于哪个会话；点击芯片可强制让面板选中该会话。
+- **② 切对话自动选中面板会话**：切换到某个对话时，注入脚本把该对话的会话 ID 通过通道推给面板，面板自动选中对应会话卡片，避免把下一条指令发错会话。
+- **优雅降级**：通道为尽力而为——若渲染进程 CSP 拦截了回环 `fetch`，②（自动选中）失效但 ①（序号显示）仍正常；纯扩展侧无额外运行时开销。
+- 生效方式：需重新打包 / 热同步后**重新安装注入补丁**（补丁里会写入通道配置），并**完全重启 Cursor**。
 
 ### 1.0.1
 
