@@ -21,6 +21,7 @@ const {
   sessionsLockDir,
 } = require("./sessions.js");
 const { readQueue, enqueueToSession, enqueueGlobal } = require("./queue.js");
+const { buildHandoffBrief } = require("./cursor-history.js");
 
 function sessionSummary(paths, indexItem, settings = readSettings(paths)) {
   const sp = sessionPaths(paths, indexItem.id);
@@ -207,13 +208,21 @@ function handoffSession(paths, sourceId, targetId, context, reason) {
   const sourceCid = sourceSummary ? sourceSummary.conversationId : "";
   const ctx = String(context || "").trim();
   const why = String(reason || "").trim() || "原会话中断/上下文已满";
+
+  // Inject the full conversation history from Cursor's SQLite DB so the target
+  // agent gets real context — not just the 160-char preview the runtime captures.
+  // Falls back to the manual context when the conversation can't be read (older
+  // Node without node:sqlite, DB missing, conversation ID not captured, etc.).
+  const historyBrief = sourceCid ? buildHandoffBrief(sourceCid) : null;
+
   const userInput = [
     `会话转接：请接管原会话「${sourceName}」未完成的任务。`,
     sourceCid ? `原 Cursor 会话 ID：${sourceCid}` : "",
     `转接原因：${why}`,
     "",
-    "需要你继续完成的内容/上下文：",
-    ctx || "（未提供额外上下文，请根据上述会话标识与任务名继续。）",
+    historyBrief ? historyBrief : "",
+    historyBrief ? "" : "需要你继续完成的内容/上下文：",
+    ctx || (historyBrief ? "" : "（未提供额外上下文，请根据上述会话标识与任务名继续。）"),
     "",
     "请基于以上内容继续完成该任务；完成后照常进入 wait 等待循环。",
   ].filter((line) => line !== "").join("\n");

@@ -260,23 +260,30 @@ function webhookEventsList(settings) {
 }
 
 // Best-effort JSON POST to a user-configured webhook. Never throws; always
-// resolves to true/false. Kept dependency-free (Node http/https) and time-boxed
-// so it can never block or crash the wait loop that triggers it.
+// resolves to { ok, error }. Kept dependency-free (Node http/https) and
+// time-boxed so it can never block or crash the wait loop that triggers it.
+//
+// Platform adaptation: the raw plugin payload ({event, session_id, status, ...})
+// is converted to the format each robot platform expects (企业微信/钉钉/飞书/Slack),
+// detected by URL hostname. For unknown URLs the raw JSON is sent as-is so
+// self-built services still work. The response body is collected and checked
+// for platform-specific error codes (errcode) — a 200 with errcode!=0 is a
+// failure, not a success.
 function postWebhook(url, body, opts = {}) {
   return new Promise((resolve) => {
     let target;
     try {
       target = new URL(String(url || ""));
     } catch {
-      resolve(false);
+      resolve({ ok: false, error: "invalid URL" });
       return;
     }
     if (target.protocol !== "http:" && target.protocol !== "https:") {
-      resolve(false);
+      resolve({ ok: false, error: "non-http URL" });
       return;
     }
-    const lib = target.protocol === "https:" ? https : http;
-    const payload = Buffer.from(JSON.stringify(body || {}), "utf8");
+    const adapted = adaptWebhookPayload(target, body || {});
+    const payload = Buffer.from(JSON.stringify(adapted.payload), "utf8");
     const headers = {
       "Content-Type": "application/json",
       "Content-Length": payload.length,
@@ -284,7 +291,8 @@ function postWebhook(url, body, opts = {}) {
     };
     if (opts.headers && typeof opts.headers === "object") Object.assign(headers, opts.headers);
     let settled = false;
-    const finish = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+    const finish = (result) => { if (!settled) { settled = true; resolve(result); } };
+    const lib = target.protocol === "https:" ? https : http;
     let req;
     try {
       req = lib.request({
@@ -294,25 +302,125 @@ function postWebhook(url, body, opts = {}) {
         method: "POST",
         headers,
       }, (res) => {
-        res.on("data", () => { /* drain; we only care it was delivered */ });
-        res.on("end", () => finish(res.statusCode >= 200 && res.statusCode < 400));
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => {
+          const httpOk = res.statusCode >= 200 && res.statusCode < 400;
+          if (!httpOk) {
+            finish({ ok: false, error: `HTTP ${res.statusCode}` });
+            return;
+          }
+          // Check platform-specific error codes in the response body.
+          const respText = Buffer.concat(chunks).toString("utf8");
+          const check = checkWebhookResponse(adapted.platform, respText);
+          finish(check);
+        });
       });
     } catch {
-      finish(false);
+      finish({ ok: false, error: "request failed" });
       return;
     }
-    req.on("error", () => finish(false));
+    req.on("error", (e) => finish({ ok: false, error: e.message || "network error" }));
     req.setTimeout(Math.max(1000, Number(opts.timeoutMs || 8000)), () => {
       try { req.destroy(); } catch { /* ignore */ }
-      finish(false);
+      finish({ ok: false, error: "timeout" });
     });
     try {
       req.write(payload);
       req.end();
     } catch {
-      finish(false);
+      finish({ ok: false, error: "write failed" });
     }
   });
+}
+
+// Convert the plugin's internal payload to the format each robot platform
+// expects, detected by URL hostname. Returns { payload, platform }.
+function adaptWebhookPayload(target, body) {
+  const host = target.hostname || "";
+  const text = formatWebhookText(body);
+
+  // 企业微信 (WeChat Work): qyapi.weixin.qq.com
+  if (host.includes("qyapi.weixin.qq.com")) {
+    return {
+      platform: "wecom",
+      payload: { msgtype: "text", text: { content: text } },
+    };
+  }
+  // 钉钉 (DingTalk): oapi.dingtalk.com
+  if (host.includes("oapi.dingtalk.com")) {
+    return {
+      platform: "dingtalk",
+      payload: { msgtype: "text", text: { content: text } },
+    };
+  }
+  // 飞书 (Feishu/Lark): open.feishu.cn or open.larksuite.com
+  if (host.includes("open.feishu.cn") || host.includes("open.larksuite.com")) {
+    return {
+      platform: "feishu",
+      payload: { msg_type: "text", content: { text } },
+    };
+  }
+  // Slack: hooks.slack.com
+  if (host.includes("hooks.slack.com")) {
+    return {
+      platform: "slack",
+      payload: { text },
+    };
+  }
+  // Discord: discord.com/api/webhooks
+  if (host.includes("discord.com") || host.includes("discordapp.com")) {
+    return {
+      platform: "discord",
+      payload: { content: text },
+    };
+  }
+  // Unknown / self-built: send raw JSON as-is.
+  return { platform: "generic", payload: body };
+}
+
+// Build a human-readable notification text from the plugin payload.
+function formatWebhookText(body) {
+  if (body.event === "test") {
+    return `【续聊助手测试】这是一条来自续聊助手的 Webhook 测试消息。\n时间：${body.at || new Date().toISOString()}`;
+  }
+  const statusLabel = { done: "✅ 完成", need_input: "⚠️ 需要关注", error: "❌ 出错" }[body.status] || body.status || "";
+  const lines = [
+    `【续聊助手通知】${statusLabel}`,
+    `会话：${body.session_name || body.session_id || "未知"}`,
+  ];
+  if (body.workspace) lines.push(`工作区：${body.workspace}`);
+  if (body.summary) lines.push(`摘要：${String(body.summary).slice(0, 500)}`);
+  if (body.at) lines.push(`时间：${body.at}`);
+  return lines.join("\n");
+}
+
+// Check the response body for platform-specific error codes. A 200 with
+// errcode!=0 (企业微信/钉钉/飞书) or ok!=true (Slack) is a delivery failure.
+function checkWebhookResponse(platform, respText) {
+  if (!respText || respText.length === 0) return { ok: true };
+  let parsed;
+  try { parsed = JSON.parse(respText); } catch { return { ok: true }; }
+
+  if (platform === "wecom" || platform === "dingtalk" || platform === "feishu") {
+    // These platforms return { errcode: 0, errmsg: "ok" } on success.
+    if (parsed.errcode !== undefined && parsed.errcode !== 0) {
+      return { ok: false, error: `errcode ${parsed.errcode}: ${parsed.errmsg || "unknown"}` };
+    }
+    return { ok: true };
+  }
+  if (platform === "slack") {
+    if (parsed.ok === false) return { ok: false, error: parsed.error || "slack error" };
+    return { ok: true };
+  }
+  if (platform === "discord") {
+    // Discord returns 204 No Content (already caught by HTTP check) or a JSON
+    // error body on failure.
+    if (parsed.message && parsed.code) return { ok: false, error: `${parsed.code}: ${parsed.message}` };
+    return { ok: true };
+  }
+  // Generic: assume success (self-built services define their own format).
+  return { ok: true };
 }
 
 module.exports = {

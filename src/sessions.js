@@ -57,10 +57,16 @@ function registerSession(paths, name) {
     if (index.sessions.length >= settings.maxConcurrentSessions) {
       throw new Error(`已达到最大并发会话数 ${settings.maxConcurrentSessions}。`);
     }
-    const id = safeSessionId(`agent-${index.sessions.length + 1}-${Date.now().toString(36)}`);
+    // Sequence the display name off the highest existing "会话 N" number instead
+    // of sessions.length, so deleting a middle session and re-creating doesn't
+    // produce a duplicate "会话 4" that collides with an already-named sibling.
+    // The internal id still carries a Date.now() suffix so it stays globally
+    // unique regardless of the display number.
+    const nextSeq = nextSessionSeq(index.sessions);
+    const id = safeSessionId(`agent-${nextSeq}-${Date.now().toString(36)}`);
     const item = {
       id,
-      name: name || `会话 ${index.sessions.length + 1}`,
+      name: name || `会话 ${nextSeq}`,
       created_at: new Date().toISOString(),
       created_at_ms: nowMs(),
     };
@@ -69,6 +75,22 @@ function registerSession(paths, name) {
     fs.mkdirSync(sessionPaths(paths, id).dir, { recursive: true });
     return item;
   });
+}
+
+// Pick the next display sequence number for a new session: one higher than the
+// largest "会话 N" number currently in use (defaulting to 1 when none parse).
+// This survives middle deletions -- e.g. after removing 会话 1 from [1,2,3,4],
+// the next create yields 会话 5, not a colliding 会话 4.
+function nextSessionSeq(sessions) {
+  let max = 0;
+  for (const s of sessions) {
+    const m = /^(?:会话\s*)?(\d+)$/.exec(String(s.name || "").trim());
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+  }
+  return max + 1;
 }
 
 function removeSession(paths, sessionId) {

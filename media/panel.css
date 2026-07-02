@@ -12,7 +12,7 @@
   --ok: var(--vscode-testing-iconPassed, #3fb950);
   --warn: var(--vscode-testing-iconQueued, #d29922);
   --danger: var(--vscode-testing-iconFailed, #f85149);
-  --shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+  --shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
 }
 
 * {
@@ -62,10 +62,10 @@ select:disabled {
 .shell {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 8px;
+  gap: 6px;
   height: 100%;
   min-height: 0;
-  padding: 10px;
+  padding: 8px;
   contain: layout style;
 }
 
@@ -75,7 +75,7 @@ select:disabled {
 
 .panel {
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 10px;
   background: var(--surface);
   box-shadow: var(--shadow);
   contain: layout paint style;
@@ -85,29 +85,27 @@ select:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 12px 14px;
+  gap: 10px;
+  padding: 8px 12px;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
 }
 
 .brand-mark {
-  width: 40px;
-  height: 40px;
+  width: 32px;
+  height: 32px;
   flex: none;
-  border-radius: 12px;
+  border-radius: 9px;
   display: grid;
   place-items: center;
-  background: linear-gradient(135deg, rgba(0, 0, 0, 0.92), rgba(28, 28, 28, 0.96));
-  color: #fff;
-  font-size: 13px;
-  font-weight: 700;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 22%, var(--surface-3)), color-mix(in srgb, var(--accent) 10%, var(--surface-2)));
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
 }
 
 .brand-copy {
@@ -117,12 +115,12 @@ select:disabled {
 .title-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
 }
 
 .title {
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 700;
 }
 
@@ -145,8 +143,9 @@ select:disabled {
 }
 
 .subtitle {
-  margin-top: 2px;
+  margin-top: 1px;
   color: var(--muted);
+  font-size: 11px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -221,7 +220,7 @@ select:disabled {
 }
 
 .status-strip {
-  padding: 8px 12px;
+  padding: 6px 12px;
 }
 
 .status-row {
@@ -267,10 +266,10 @@ select:disabled {
 }
 
 .meta-hint {
-  margin-top: 8px;
+  margin-top: 4px;
   color: var(--muted);
-  font-size: 12px;
-  max-height: 48px;
+  font-size: 11px;
+  max-height: 40px;
   overflow: hidden;
 }
 
@@ -505,10 +504,10 @@ select:disabled {
 
 .composer {
   border-top: 1px solid var(--border);
-  padding: 12px 14px 14px;
+  padding: 10px 12px 12px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   min-height: 0;
   height: 100%;
   overflow: hidden auto;
@@ -529,8 +528,14 @@ select:disabled {
 }
 
 .composer-title {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 700;
+}
+
+.composer-summary {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .hint {
@@ -540,14 +545,14 @@ select:disabled {
 
 .input-shell {
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 10px;
   background: color-mix(in srgb, var(--bg) 95%, white 5%);
   overflow: hidden;
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
-  min-height: 110px;
-  max-height: 200px;
+  min-height: 80px;
+  max-height: 180px;
 }
 
 .input-shell textarea {
@@ -759,7 +764,13 @@ select:disabled {
 .queued-meta-row {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 4px;
+}
+
+.queued-spacer {
+  flex: 1 1 auto;
+  min-width: 4px;
 }
 
 .queued-tag {
@@ -808,9 +819,50 @@ select:disabled {
 
 .queued-actions {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-direction: row;
+  align-items: center;
+  gap: 2px;
   flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.queued-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-3) 50%, transparent);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease;
+}
+
+.queued-action-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.queued-action-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.queued-action-remove {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  font-size: 14px;
+}
+
+.queued-action-remove:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 60%, var(--border));
 }
 
 .attachment-remove {
@@ -1109,7 +1161,7 @@ select:disabled {
 .attachment-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 5px;
   align-items: center;
 }
 
@@ -1118,7 +1170,7 @@ select:disabled {
 }
 
 .attachment-list {
-  margin-bottom: 10px;
+  margin-bottom: 6px;
 }
 
 .attachment-chip {
@@ -1193,21 +1245,21 @@ select:disabled {
 
 .session-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 8px;
-  min-height: 42px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px;
+  min-height: 38px;
   flex: 0 0 auto;
   contain: layout style;
 }
 
 .session-card {
   min-width: 0;
-  min-height: 54px;
+  min-height: 48px;
   display: grid;
   grid-template-columns: 10px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 9px;
-  padding: 8px 10px;
+  gap: 8px;
+  padding: 6px 10px;
   border-radius: 8px;
   text-align: left;
   background: var(--surface-2);
@@ -1217,11 +1269,6 @@ select:disabled {
 
 .session-card:hover {
   background: var(--surface-3);
-}
-
-.session-card.selected {
-  border-color: color-mix(in srgb, var(--accent) 58%, var(--border));
-  background: color-mix(in srgb, var(--accent) 12%, var(--surface-2));
 }
 
 .session-dot {
@@ -1367,10 +1414,11 @@ select:disabled {
 }
 
 .slim-status .meta-hint {
-  max-height: 40px;
+  max-height: 32px;
 }
 
 .handoff-context-row {
+  display: flex;
   flex-direction: column;
   align-items: stretch;
   gap: 6px;
@@ -1511,11 +1559,16 @@ select:disabled {
 
 .setting-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 120px;
+  grid-template-columns: minmax(0, 220px) minmax(180px, 1fr);
   gap: 10px;
   align-items: center;
   margin: 10px 0;
   font-size: 12px;
+}
+
+.setting-row > span {
+  line-height: 1.4;
+  word-break: break-word;
 }
 
 .setting-row input,
@@ -1567,6 +1620,33 @@ select:disabled {
 .session-card.attention-error {
   border-color: color-mix(in srgb, var(--danger) 60%, var(--border));
   background: color-mix(in srgb, var(--danger) 12%, var(--surface-2));
+}
+
+/* Selected must stay visible even when an attention state (need_input / error)
+   is active on the same card. attention tints the background to signal status;
+   selected layers a bright accent border + left accent bar on top so the user
+   can always tell which card is active. Without this, attention-need (yellow)
+   silently overrides selected because both selectors have equal specificity and
+   attention is defined later. */
+.session-card.selected {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+  background:
+    linear-gradient(to right, var(--accent) 0 3px, transparent 3px),
+    color-mix(in srgb, var(--accent) 14%, var(--surface-2));
+}
+
+.session-card.selected.attention-need {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--warn) 30%);
+  background:
+    linear-gradient(to right, var(--accent) 0 3px, transparent 3px),
+    color-mix(in srgb, var(--warn) 10%, var(--surface-2));
+}
+
+.session-card.selected.attention-error {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--danger) 30%);
+  background:
+    linear-gradient(to right, var(--accent) 0 3px, transparent 3px),
+    color-mix(in srgb, var(--danger) 10%, var(--surface-2));
 }
 
 /* Session card is now a div (role=button) so it can host nested action buttons. */

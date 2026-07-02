@@ -1251,7 +1251,13 @@ function notifyWebhookResult(project, sessionId, summary, resultStatus = "done",
     workspace_path: workspaceRoot,
     at: isoNow(),
   };
-  Promise.resolve(shared.postWebhook(url, body, { timeoutMs: 8000 })).catch(() => { /* best effort */ });
+  Promise.resolve(shared.postWebhook(url, body, { timeoutMs: 8000 })).then((r) => {
+    if (!r.ok) {
+      // Log delivery failures to stderr so the user can see why notifications
+      // aren't arriving, without disrupting the wait loop.
+      try { process.stderr.write(`[webhook] 送达失败：${r.error || "未知错误"}\n`); } catch { /* ignore */ }
+    }
+  }).catch(() => { /* best effort */ });
 }
 
 // Per-session project scope: a workspace may hold many projects, so a session

@@ -28,6 +28,7 @@ const {
   getAllSessions, dispatchPayload, handoffSession,
 } = require("./session-status.js");
 const { readHistory } = require("./history.js");
+const { buildHandoffBrief, readConversation } = require("./cursor-history.js");
 const { savePastedImage, readImageThumb } = require("./image-utils.js");
 const {
   copySmartInstruction, copyAgentInstruction, copyMcpInstruction,
@@ -344,6 +345,10 @@ class PanelProvider {
     } else if (message.type === "handoffSession") {
       const res = handoffSession(paths, message.sourceId, message.targetId, message.context, message.reason);
       this.event(`已转接「${res.sourceName}」→ ${res.targetId}，等待目标会话消费。`);
+    } else if (message.type === "getConversationBrief") {
+      // Panel requests a full conversation brief for the handoff textarea prefill.
+      const brief = buildHandoffBrief(String(message.composerId || ""));
+      this.reply({ type: "conversationBrief", brief, composerId: message.composerId });
     } else if (message.type === "clearQueue") {
       clearQueue(paths, message.scope || "session", message.sessionId || "agent-1");
       this.event("已清空队列。");
@@ -393,10 +398,10 @@ class PanelProvider {
         transport: "panel",
         at: new Date().toISOString(),
       };
-      const ok = await shared.postWebhook(url, body, { timeoutMs: 8000 });
-      this.event(ok
-        ? `Webhook 测试成功：${compactForUi(url, 80)} 已返回 2xx/3xx。`
-        : `Webhook 测试失败：无法送达 ${compactForUi(url, 80)}（请检查 URL、网络或服务是否可达）。`);
+      const result = await shared.postWebhook(url, body, { timeoutMs: 8000 });
+      this.event(result.ok
+        ? `Webhook 测试成功：${compactForUi(url, 80)} 消息已送达。`
+        : `Webhook 测试失败：${result.error || "未知错误"}（请检查 URL、网络或服务是否可达）。`);
       return true;
     } else if (message.type === "installRetryPatch") {
       const result = installRetryPatch(this.context);

@@ -8,13 +8,14 @@
 const vscode = require("vscode");
 
 async function pickFiles() {
-  const uris = await vscode.window.showOpenDialog({ title: "选择要引用的文件", canSelectFiles: true, canSelectFolders: false, canSelectMany: true });
+  const uris = await vscode.window.showOpenDialog({ title: "选择要引用的文件或文件夹", canSelectFiles: true, canSelectFolders: true, canSelectMany: true });
   return (uris || []).map((uri) => uri.fsPath);
 }
 
 async function pickFolders() {
-  const uris = await vscode.window.showOpenDialog({ title: "选择要引用的文件夹", canSelectFiles: false, canSelectFolders: true, canSelectMany: true });
-  return (uris || []).map((uri) => uri.fsPath);
+  // Kept for backward compatibility — now delegates to pickFiles since the
+  // merged picker already allows folder selection.
+  return pickFiles();
 }
 
 async function pickProjectFolder(paths) {

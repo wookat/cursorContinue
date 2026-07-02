@@ -28,25 +28,23 @@ function panelHtml(context, webview) {
     <div class="shell compact-shell">
       <section class="panel topbar app-topbar">
         <div class="brand">
-          <div class="brand-mark">续</div>
+          <div class="brand-mark"><svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M4 7h10M4 12h16M4 17h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="m17 7 3 3-3 3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
           <div class="brand-copy">
             <div class="title-row">
               <div class="title">续聊助手</div>
-              <span id="onlinePill" class="status-pill">在线会话 0/0</span>
+              <span id="onlinePill" class="status-pill">0/0</span>
               <span id="queuePill" class="meta-chip">待消费 0</span>
-              <span id="modePill" class="meta-chip" title="启动模式：装了 MCP 配置走 MCP（更稳），否则走 shell">模式：shell</span>
-              <span id="patchState" class="meta-chip">重试助手：未知</span>
             </div>
             <div id="workspace" class="subtitle">等待打开项目</div>
           </div>
         </div>
         <div class="header-actions">
-          <button class="mini-button" id="newSession">新建会话</button>
-          <button class="mini-button" id="installMcpTop" title="把 MCP 服务器写入 .cursor/mcp.json（首次用 MCP 模式需要，装好后完全重启 Cursor）">① 安装 MCP 配置</button>
-          <button class="mini-button primary" id="copyInstruction" title="复制启动指令并发给 Cursor 对话。装了 MCP 就给 MCP 指令，否则给 shell 指令。">② 复制启动指令</button>
-          <button class="mini-button" id="openWindowTop" title="在编辑器区打开一个独立面板实例，并自动移入新窗口（可拖到第二屏）；底部面板与所有独立窗口共享同一份会话状态、实时同步，便于多窗口多 Agent 管理">⧉ 独立窗口</button>
-          <button class="mini-button" id="settingsBtn">设置</button>
-          <button class="mini-button" id="moreBtn">更多</button>
+          <button class="mini-button" id="newSession" title="新建会话">＋</button>
+          <button class="mini-button" id="installMcpTop" title="把 MCP 服务器写入 .cursor/mcp.json（首次用 MCP 模式需要，装好后完全重启 Cursor）">MCP</button>
+          <button class="mini-button primary" id="copyInstruction" title="复制启动指令并发给 Cursor 对话。装了 MCP 就给 MCP 指令，否则给 shell 指令。">复制指令</button>
+          <button class="mini-button" id="openWindowTop" title="在独立窗口打开面板">⧉</button>
+          <button class="mini-button" id="settingsBtn" title="设置">⚙</button>
+          <button class="mini-button" id="moreBtn" title="更多操作">⋯</button>
         </div>
       </section>
 
@@ -55,7 +53,7 @@ function panelHtml(context, webview) {
           <span id="statusText" class="meta-chip">等待会话连接</span>
           <span id="selectedSessionText" class="meta-chip">当前会话：未选择</span>
           <span class="status-row-spacer"></span>
-          <button class="mini-button" id="eventHistoryBtn">执行记录</button>
+          <button class="mini-button" id="eventHistoryBtn">记录</button>
         </div>
         <div id="events" class="meta-hint"></div>
       </section>
@@ -65,14 +63,14 @@ function panelHtml(context, webview) {
           <div class="session-head">
             <div>
               <div class="composer-title">会话列表</div>
-              <div class="composer-summary">每个 Cursor 官方对话使用一个会话启动指令，可并行多个。点击选择会话；点卡片右侧 <b>⋯</b> 或 <b>右键卡片</b> 可转接 / 重命名 / 设参数 / 启动终端 / 停止 / 删除。会话中断时卡片上会直接出现「↪ 转接」。</div>
+              <div class="composer-summary">点击选择会话；右键卡片或点 <b>⋯</b> 打开操作菜单（转接 / 重命名 / 参数 / 删除等）。</div>
             </div>
           </div>
           <div id="sessionList" class="session-list"></div>
           <div class="composer-head">
             <div>
               <div class="composer-title">下一条指令</div>
-              <div class="composer-summary">选择发送目标后入队；Agent 下一次运行 bridge 时按调度策略消费。</div>
+              <div class="composer-summary">选择目标后入队，Agent 下次运行 bridge 时消费。</div>
             </div>
           </div>
           <div class="target-row">
@@ -86,7 +84,6 @@ function panelHtml(context, webview) {
           </div>
           <div class="toolbar-row">
             <button class="mini-button" id="pickFiles">引用文件</button>
-            <button class="mini-button" id="pickFolders">引用文件夹</button>
             <button class="mini-button" id="pickEditor">当前编辑器</button>
             <button class="mini-button" id="pickWorkspace">工作区</button>
           </div>
@@ -95,7 +92,7 @@ function panelHtml(context, webview) {
             <textarea id="instruction" placeholder="输入给 Agent 的指令，Ctrl+Enter 发送。也可以直接粘贴图片。"></textarea>
           </div>
           <div class="composer-footer">
-            <div class="hint">保活到期时 Agent 会收到 KEEPALIVE_NOOP，并重新进入 wait。</div>
+            <div class="hint">Ctrl+Enter 发送 · 粘贴图片自动上传</div>
             <button class="mini-button primary send-button" id="send">发送</button>
           </div>
           <div id="queued-root"></div>

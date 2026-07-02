@@ -159,18 +159,11 @@
       state.selectedSessionId = state.sessions[0]?.id || "";
     }
 
-    const onlineText = `在线会话 ${status.onlineCount || 0}/${status.maxConcurrentSessions || state.sessions.length || 0}`;
+    const onlineText = `${status.onlineCount || 0}/${status.maxConcurrentSessions || state.sessions.length || 0}`;
     const onlineClass = `status-pill ${(status.onlineCount || 0) > 0 ? "running" : ""}`;
     setTextIfChanged($("onlinePill"), onlineText);
     setClassIfChanged($("onlinePill"), onlineClass);
     setTextIfChanged($("queuePill"), `待消费 ${status.totalQueueLength || 0}`);
-    const mcpOn = status.mcpInstalled === true;
-    setTextIfChanged($("modePill"), mcpOn ? "模式：MCP" : "模式：shell");
-    setClassIfChanged($("modePill"), mcpOn ? "meta-chip meta-chip-ready" : "meta-chip");
-    const patchLabelTxt = patchLabel(status.patch);
-    const patchClass = status.patch && status.patch.installed ? "meta-chip meta-chip-ready" : "meta-chip";
-    setTextIfChanged($("patchState"), patchLabelTxt);
-    setClassIfChanged($("patchState"), patchClass);
     setTextIfChanged($("workspace"), status.workspaceRoot || status.detail || "等待打开项目");
     setTextIfChanged($("statusText"), status.statusText || "暂无在线会话，请复制启动指令到 Cursor 对话。");
     const patch = status.patch || {};
@@ -292,13 +285,6 @@
     const projectChip = session.projectDir
       ? `<span class="session-project" title="项目目录：${escapeHtml(session.projectDir)}（本会话只在此目录内工作）">📁 ${escapeHtml(session.projectName || session.projectDir)}</span>`
       : "";
-    // Surface handoff inline exactly when it's relevant: a session that stalled
-    // (waiter didn't return to wait) or dropped offline is the prime candidate to
-    // hand its unfinished work to another session (contextual revelation).
-    const needsHandoff = session.activity === "stalled" || (!session.connected && !!session.state && session.state !== "new");
-    const quickHandoff = needsHandoff
-      ? `<button class="session-quick-handoff" data-quick-handoff="${escapeHtml(session.id)}" title="把该会话未完成的工作转接给其它会话继续">↪ 转接</button>`
-      : "";
     const html = `
       <div class="session-card ${session.id === state.selectedSessionId ? "selected" : ""}${attentionClass(session)}" role="button" tabindex="0" aria-label="会话 ${escapeHtml(session.name || session.id)}" data-session-id="${escapeHtml(session.id)}">
         <span class="${sessionDotClass(session)}"></span>
@@ -308,7 +294,6 @@
           ${resultBadge(session)}
         </span>
         <span class="session-side">
-          ${quickHandoff}
           <span class="session-queue">队列 ${session.queueLength || 0}</span>
           <button class="session-menu-btn" data-session-menu="${escapeHtml(session.id)}" aria-haspopup="menu" aria-label="会话操作" title="会话操作（也可右键卡片）">⋯</button>
         </span>
@@ -408,12 +393,13 @@
             <span class="queued-tag">${escapeHtml(scope === "global" ? "空闲优先" : sessionId)}</span>
             <span class="queued-tag">${escapeHtml(entry.source || "panel")}</span>
             ${tagsHtml}
+            <span class="queued-spacer"></span>
+            <div class="queued-actions">
+              <button class="queued-action-btn" data-move-queued="${id}" data-dir="up" data-session-id="${sid}" data-scope="${sc}" title="上移" aria-label="上移">↑</button>
+              <button class="queued-action-btn" data-move-queued="${id}" data-dir="down" data-session-id="${sid}" data-scope="${sc}" title="下移" aria-label="下移">↓</button>
+              <button class="queued-action-btn queued-action-remove" data-remove-queued="${id}" data-session-id="${sid}" data-scope="${sc}" title="移除" aria-label="移除">×</button>
+            </div>
           </div>
-        </div>
-        <div class="queued-actions">
-          <button class="mini-button" data-move-queued="${id}" data-dir="up" data-session-id="${sid}" data-scope="${sc}" title="上移">↑</button>
-          <button class="mini-button" data-move-queued="${id}" data-dir="down" data-session-id="${sid}" data-scope="${sc}" title="下移">↓</button>
-          <button class="mini-button queued-remove" data-remove-queued="${id}" data-session-id="${sid}" data-scope="${sc}">移除</button>
         </div>
       </div>
     `;
@@ -611,8 +597,17 @@
   function prefillHandoffContext() {
     const sid = $("handoffSource").value;
     const session = (state.sessions || []).find((s) => s.id === sid);
+    // Start with the lightweight preview (last instruction + last result) so the
+    // textarea isn't empty while we fetch the full conversation history.
     $("handoffContext").value = handoffContextFor(session);
     updateHandoffHint();
+    // Request the full conversation brief from the extension host, which reads
+    // Cursor's SQLite DB directly. The brief replaces the preview when it arrives.
+    const cid = session && session.conversationId;
+    if (cid) {
+      $("handoffContext").placeholder = "正在从 Cursor 读取完整对话历史…";
+      send("getConversationBrief", { composerId: cid });
+    }
   }
 
   function updateHandoffHint() {
@@ -774,7 +769,6 @@
     const testWebhookBtn = $("testWebhookBtn");
     if (testWebhookBtn) testWebhookBtn.addEventListener("click", () => send("testWebhook", { url: ($("setWebhookUrl").value || "").trim() }));
     $("pickFiles").addEventListener("click", () => send("pickFiles"));
-    $("pickFolders").addEventListener("click", () => send("pickFolders"));
     $("pickEditor").addEventListener("click", () => send("pickActiveEditor"));
     $("pickWorkspace").addEventListener("click", () => send("pickWorkspaceFolder"));
     $("sessionList").addEventListener("click", (event) => {
@@ -785,15 +779,6 @@
         event.stopPropagation();
         const rect = menuBtn.getBoundingClientRect();
         openSessionMenu(menuBtn.dataset.sessionMenu, rect.left, rect.bottom + 4);
-        return;
-      }
-      // The inline "转接" shortcut (shown on stalled/offline cards) jumps to handoff.
-      const quick = closest("[data-quick-handoff]");
-      if (quick) {
-        event.stopPropagation();
-        selectSession(quick.dataset.quickHandoff);
-        _menuSessionId = quick.dataset.quickHandoff;
-        openHandoff();
         return;
       }
       // A click on the conversation-id chip copies the id (via the extension's
@@ -930,6 +915,15 @@
       }
     }
     if (data.type === "resultTimeline") renderTimeline(data.items || []);
+    if (data.type === "conversationBrief" && data.brief) {
+      // Full conversation history arrived from the extension host — replace the
+      // lightweight preview in the handoff textarea with the real context.
+      const ta = $("handoffContext");
+      if (ta && document.getElementById("handoffDialog") && !document.getElementById("handoffDialog").classList.contains("hidden")) {
+        ta.value = data.brief;
+        ta.placeholder = "要让目标会话继续完成的内容…";
+      }
+    }
     if (data.type === "extensionSettingsSaved") {
       state.settings = data.settings || state.settings || {};
       syncSettingsInputs();
