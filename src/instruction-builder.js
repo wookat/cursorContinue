@@ -21,18 +21,22 @@ const { readSettings } = require("./settings.js");
 const { effectiveSessionSettings } = require("./sessions.js");
 const { resolveInstructionSession } = require("./session-status.js");
 
+function titleInstruction(sessionId) {
+  return `请把 Cursor 右侧官方会话标题设置成一句短标题（建议 8-18 个中文字符），概括本会话真实任务；标题里不要包含"续聊助手"、session_id 或实现细节。本地面板会按 Cursor 官方标题同步显示。当前 session_id="${sessionId}"。`;
+}
+
 function buildAgentInstruction(context, sessionId) {
   const paths = ensureRuntime(context);
   const settings = readSettings(paths);
   const resolved = resolveInstructionSession(paths, settings, sessionId);
   const id = resolved.id;
   const waitCmd = runtimeWaitCommand(paths, effectiveSessionSettings(paths, settings, id), id);
-  const text = `请从现在开始使用"续聊助手"的多会话 bridge 循环工作。
+  const text = `请从现在开始使用"续聊助手"的 shell bridge 循环工作。
 
 当前会话 ID：${id}
 
 具体要求：
-1. 正常完成当前这轮任务。
+1. 正常完成当前这轮任务，并设置本会话标题：${titleInstruction(id)}
 2. 每轮任务结束后，不要调用 input()，也不要让我在终端手动输入。
 3. 第一次进入等待时，请在当前项目终端运行下面这条命令：
 
@@ -95,8 +99,8 @@ function buildMcpInstruction(context, sessionId) {
 当前会话 ID：${id}
 
 具体要求：
-1. 正常完成当前这轮任务。
-2. 每轮任务结束后，调用 MCP 工具 \`wait_for_instruction\`（参数 session_id="${id}"，可附带 report 用一句话反馈刚做完的事、report_status 用 done/need_input/error）来等待下一条指令。这是 MCP 工具调用，会被原生阻塞等待，**不会被放到后台**，请耐心等它返回。
+1. 正常完成当前这轮任务，并设置本会话标题：${titleInstruction(id)}
+2. 每轮任务结束后，调用 MCP 工具 \`wait_for_instruction\`（参数 session_id="${id}"，可附带 report 用一句话反馈刚做完的事、report_status 用 done/need_input/error）来等待下一条指令。这是 MCP 工具调用，会被 Cursor 原生阻塞等待；本模式不要运行 shell wait 命令。
 3. 按 \`wait_for_instruction\` 的返回值处理（工具还会返回结构化字段 \`kind\` 和 \`next_action\`，优先据此判断）：
    - \`kind=instruction\`（普通文本，含文件/图片上下文）→ 当作用户指令执行；执行完回到第 2 步**再次调用** \`wait_for_instruction\`。
    - \`kind=keepalive\`（以 \`KEEPALIVE_NOOP\` 开头）→ 当前没有新指令，**不要修改项目、不要结束本轮**，立即**再次调用** \`wait_for_instruction\`。
@@ -106,7 +110,8 @@ function buildMcpInstruction(context, sessionId) {
    - 经验法则：只要 \`next_action=call_wait_for_instruction\`，就继续调用。
 4. 不要调用 input()，也不要让我在终端手动输入；所有新指令都来自面板。
 5. **绝不要因为"已调用工具 / 已进入等待 / 任务已完成"就提前结束本轮**：无论你是刚执行完一条指令、还是自认为任务已彻底做完，都必须**立即再次调用** \`wait_for_instruction\`。是否结束由我的 \`stop\` 决定，不由你决定——只有收到 \`stop\` 才结束循环。
-6. 图片上下文会给出本地图片文件路径，请用读取文件工具打开查看。`;
+6. 不要执行或生成 shell 版启动命令；只有用户明确要求 shell 模式时才使用终端命令。
+7. 图片上下文会给出本地图片文件路径，请用读取文件工具打开查看。`;
   return { id, text, created: resolved.created };
 }
 
@@ -117,13 +122,42 @@ async function copyMcpInstruction(context, sessionId) {
 }
 
 // True when this project's .cursor/mcp.json already registers our MCP server.
-function mcpInstalled(paths) {
+function mcpConfigStatus(paths) {
   try {
     const cfg = readJson(paths.mcpConfig, null);
-    return Boolean(cfg && cfg.mcpServers && cfg.mcpServers["local-continue"]);
+    const entry = cfg && cfg.mcpServers && cfg.mcpServers["local-continue"];
+    if (!entry) {
+      return { installed: false, current: false, stale: false, target: paths.mcpConfig, reason: "missing" };
+    }
+    const args = Array.isArray(entry.args) ? entry.args : [];
+    const stateIdx = args.indexOf("--state-dir");
+    const serverArg = args.find((arg) => String(arg).replace(/\\/g, "/").endsWith("/runtime/mcp-server.js")) || "";
+    const stateArg = stateIdx >= 0 ? args[stateIdx + 1] || "" : "";
+    const norm = (value) => {
+      try { return path.resolve(String(value || "")).toLowerCase(); }
+      catch { return String(value || "").toLowerCase(); }
+    };
+    const serverMatches = norm(serverArg) === norm(paths.mcpServerJs);
+    const stateMatches = norm(stateArg) === norm(paths.stateDir);
+    const current = Boolean(serverMatches && stateMatches);
+    return {
+      installed: true,
+      current,
+      stale: !current,
+      target: paths.mcpConfig,
+      server: serverArg,
+      stateDir: stateArg,
+      expectedServer: paths.mcpServerJs,
+      expectedStateDir: paths.stateDir,
+      reason: !serverMatches ? "server-path" : !stateMatches ? "state-dir" : "",
+    };
   } catch {
-    return false;
+    return { installed: false, current: false, stale: false, target: paths.mcpConfig, reason: "unreadable" };
   }
+}
+
+function mcpInstalled(paths) {
+  return mcpConfigStatus(paths).installed;
 }
 
 // The "smart" copy used by the top bar: hand back the MCP start instruction once
@@ -186,6 +220,7 @@ module.exports = {
   installMcpConfig,
   buildMcpInstruction,
   copyMcpInstruction,
+  mcpConfigStatus,
   mcpInstalled,
   copySmartInstruction,
   startWaitTerminal,

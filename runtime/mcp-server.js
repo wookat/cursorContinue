@@ -28,6 +28,7 @@ const SERVER_INFO = { name: "local-continue-续聊助手", version: "1.2.0" };
 const DEFAULT_SOFT_TIMEOUT_MS = 3300 * 1000;
 const BASE_POLL_MS = 200;
 const MAX_POLL_MS = 1000;
+const PROGRESS_NOTIFY_INTERVAL_MS = 25000;
 
 function defaultStateDir() {
   return path.join(process.cwd(), ".cursor", "local-continue-state");
@@ -152,6 +153,7 @@ async function waitForInstructionMcp(project, sessionId, opts) {
   });
 
   let lastHeartbeat = Date.now();
+  let lastProgress = 0;
   let lastSessionSig = "init";
   let lastGlobalSig = "init";
   const notifier = inst.createQueueNotifier([
@@ -160,6 +162,10 @@ async function waitForInstructionMcp(project, sessionId, opts) {
   ]);
 
   try {
+    if (opts.onProgress) {
+      opts.onProgress(0, "wait_for_instruction started");
+      lastProgress = Date.now();
+    }
     for (;;) {
       if (opts.isCancelled && opts.isCancelled()) {
         session.writeStatus(runId, "cancelled", { transport: "mcp", uptime_ms: inst.nowMs() - startedAtMs });
@@ -173,6 +179,11 @@ async function waitForInstructionMcp(project, sessionId, opts) {
         session.refreshWaiter(runId);
         session.writeStatus(runId, "waiting", { transport: "mcp", uptime_ms: inst.nowMs() - startedAtMs, keepalive_deadline_ms: keepaliveDeadline });
         lastHeartbeat = now;
+      }
+      if (opts.onProgress && now - lastProgress >= PROGRESS_NOTIFY_INTERVAL_MS) {
+        const elapsedSeconds = Math.max(1, Math.round((now - startedAtMs) / 1000));
+        opts.onProgress(elapsedSeconds, `waiting ${elapsedSeconds}s for session ${sessionId}`);
+        lastProgress = now;
       }
 
       let item = null;
@@ -331,6 +342,14 @@ function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
+function progressNotify(progressToken, progress, message, total) {
+  if (progressToken === undefined || progressToken === null) return;
+  const params = { progressToken, progress };
+  if (total !== undefined && total !== null) params.total = total;
+  if (message) params.message = message;
+  send({ jsonrpc: "2.0", method: "notifications/progress", params });
+}
+
 function respond(id, result) {
   send({ jsonrpc: "2.0", id, result });
 }
@@ -364,6 +383,7 @@ function buildStatus(sessionId) {
 async function handleToolCall(id, params) {
   const name = params && params.name;
   const args = (params && params.arguments) || {};
+  const progressToken = params && params._meta ? params._meta.progressToken : undefined;
   if (name === "report_result") {
     const summary = String(args.summary || "").trim();
     if (!summary) return respond(id, textResult("summary 不能为空。", true));
@@ -385,6 +405,12 @@ async function handleToolCall(id, params) {
         report: args.report || null,
         reportStatus: args.report_status || "done",
         isCancelled: () => state.cancelled,
+        onProgress: (progress, message) => progressNotify(
+          progressToken,
+          progress,
+          message,
+          SOFT_TIMEOUT_MS > 0 ? Math.round(SOFT_TIMEOUT_MS / 1000) : undefined,
+        ),
       });
       const kind = outcome.kind || "instruction";
       const nextAction = kind === "stop" ? "stop"

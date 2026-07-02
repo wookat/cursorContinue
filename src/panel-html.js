@@ -28,10 +28,11 @@ function panelHtml(context, webview) {
     <div class="shell compact-shell">
       <section class="panel topbar app-topbar">
         <div class="brand">
-          <div class="brand-mark"><svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M4 7h10M4 12h16M4 17h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="m17 7 3 3-3 3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="brand-mark"><svg width="20" height="20" viewBox="0 0 24 24" fill="none"><rect x="1.5" y="1.5" width="21" height="21" rx="6" fill="#E8F2FF" stroke="#9CB9DA" stroke-width="1.5"/><path d="M6.5 8.2H12.2" stroke="#4D79B3" stroke-width="2.1" stroke-linecap="round"/><path d="M6.5 12H12.4" stroke="#4D79B3" stroke-width="2.1" stroke-linecap="round"/><path d="M6.5 15.8H12.2" stroke="#4D79B3" stroke-width="2.1" stroke-linecap="round"/><path d="M14 12H16.8" stroke="#4D79B3" stroke-width="2.1" stroke-linecap="round"/><path d="M15.8 9.4L18.4 12L15.8 14.6" stroke="#4D79B3" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><circle cx="18.4" cy="5.6" r="1.4" fill="#78D28C"/></svg></div>
           <div class="brand-copy">
             <div class="title-row">
               <div class="title">续聊助手</div>
+              <span id="mcpPill" class="meta-chip">MCP ?</span>
               <span id="onlinePill" class="status-pill">0/0</span>
               <span id="queuePill" class="meta-chip">待消费 0</span>
             </div>
@@ -52,9 +53,11 @@ function panelHtml(context, webview) {
         <div class="status-row">
           <span id="statusText" class="meta-chip">等待会话连接</span>
           <span id="selectedSessionText" class="meta-chip">当前会话：未选择</span>
+          <span id="syncPill" class="meta-chip sync-chip">同步中</span>
           <span class="status-row-spacer"></span>
           <button class="mini-button" id="eventHistoryBtn">记录</button>
         </div>
+        <div id="currentSessionDetail" class="current-session-detail"></div>
         <div id="events" class="meta-hint"></div>
       </section>
 
@@ -77,13 +80,14 @@ function panelHtml(context, webview) {
             <label>发送到</label>
             <select id="targetMode">
               <option value="direct">当前会话</option>
-              <option value="idle-first">空闲优先</option>
+              <option value="idle-first">待分配队列</option>
               <option value="broadcast">全部在线</option>
               <option value="round-robin">轮询分配</option>
             </select>
           </div>
           <div class="toolbar-row">
             <button class="mini-button" id="pickFiles">引用文件</button>
+            <button class="mini-button" id="pickFolders">引用文件夹</button>
             <button class="mini-button" id="pickEditor">当前编辑器</button>
             <button class="mini-button" id="pickWorkspace">工作区</button>
           </div>
@@ -118,7 +122,7 @@ function panelHtml(context, webview) {
           <section class="advanced-section">
             <div class="advanced-title">队列</div>
             <button class="mini-button" id="showQueueBtn">查看队列</button>
-            <button class="mini-button" id="clearGlobalQueue">清空空闲优先队列</button>
+            <button class="mini-button" id="clearGlobalQueue">清空待分配队列</button>
           </section>
           <section class="advanced-section">
             <div class="advanced-title">记录</div>
@@ -146,7 +150,9 @@ function panelHtml(context, webview) {
       <div class="modal-card settings-dialog">
         <div class="modal-head"><div class="modal-title">设置</div><button class="mini-button" data-close-modal="settingsDialog">关闭</button></div>
         <label class="setting-row"><span>最大并发会话数</span><input id="setMaxSessions" type="number" min="1"></label>
-        <label class="setting-row"><span>默认调度策略</span><select id="setSchedulingMode"><option value="idle-first">空闲优先</option><option value="direct">当前会话</option><option value="broadcast">全部在线</option><option value="round-robin">轮询分配</option></select></label>
+        <label class="setting-row"><span>单会话队列上限</span><input id="setPerSessionQueueLimit" type="number" min="1"></label>
+        <label class="setting-row"><span>待分配队列上限</span><input id="setGlobalQueueLimit" type="number" min="1"></label>
+        <label class="setting-row"><span>默认调度策略</span><select id="setSchedulingMode"><option value="idle-first">待分配队列</option><option value="direct">当前会话</option><option value="broadcast">全部在线</option><option value="round-robin">轮询分配</option></select></label>
         <label class="setting-row"><span>保活间隔秒数</span><input id="setKeepalive" type="number" min="10"></label>
         <label class="setting-row"><span>会话需关注时弹系统通知</span><input id="setNotifyOnAttention" type="checkbox"></label>
         <div class="advanced-title" style="margin-top:6px;">完成通知 · Webhook</div>
@@ -201,6 +207,14 @@ function panelHtml(context, webview) {
         <label class="setting-row"><span>等待超时秒数</span><input id="sessTimeout" type="number" min="0" placeholder="全局默认"></label>
         <label class="setting-row"><span>队列轮询间隔秒数</span><input id="sessPoll" type="number" min="0.1" step="0.1" placeholder="全局默认"></label>
         <div class="modal-actions"><button class="mini-button" id="clearSessionSettings">清除覆盖</button><button class="mini-button primary" id="saveSessionSettings">保存</button></div>
+      </div>
+    </div>
+
+    <div id="sessionDetailDialog" class="modal-layer hidden">
+      <div class="modal-card session-detail-dialog">
+        <div class="modal-head"><div id="sessionDetailTitle" class="modal-title">会话详情</div><button class="mini-button" data-close-modal="sessionDetailDialog">关闭</button></div>
+        <div id="sessionDetailMeta" class="meta-hint">正在读取会话详情…</div>
+        <div id="sessionDetailBody" class="session-detail-body"></div>
       </div>
     </div>
 

@@ -21,9 +21,17 @@ const {
   sessionsLockDir,
 } = require("./sessions.js");
 const { readQueue, enqueueToSession, enqueueGlobal } = require("./queue.js");
-const { buildHandoffBrief } = require("./cursor-history.js");
+const { buildHandoffBrief, readConversationMeta, findConversationBySessionId } = require("./cursor-history.js");
 
-function sessionSummary(paths, indexItem, settings = readSettings(paths)) {
+function sessionDisplaySeq(indexItem, index) {
+  const fromId = /^agent-(\d+)/.exec(String((indexItem && indexItem.id) || ""));
+  if (fromId) return Number(fromId[1]);
+  const fromName = /(?:会话|浼氳瘽)?\s*(\d+)/.exec(String((indexItem && indexItem.name) || ""));
+  if (fromName) return Number(fromName[1]);
+  return index + 1;
+}
+
+function sessionSummary(paths, indexItem, settings = readSettings(paths), index = 0) {
   const sp = sessionPaths(paths, indexItem.id);
   const status = readJsonCached(sp.status, {});
   const heartbeatMs = Number(status.heartbeat_ms || 0);
@@ -75,18 +83,27 @@ function sessionSummary(paths, indexItem, settings = readSettings(paths)) {
     activity = "offline";
   }
   const workingAgeMs = (activity === "working" || activity === "stalled") ? (heartbeatAgeMs || 0) : 0;
-  // Display name precedence: a manual rename wins; otherwise the auto-title
-  // derived from the first instruction; otherwise the default "会话 N".
+  const capturedConversationId = status.conversation_id || "";
+  const cursorConversation = capturedConversationId
+    ? readConversationMeta(capturedConversationId)
+    : findConversationBySessionId(sp.id);
+  const conversationId = capturedConversationId || (cursorConversation && cursorConversation.composerId) || "";
+  const officialTitle = cursorConversation && cursorConversation.name ? cursorConversation.name : "";
+  // Display name precedence: Cursor's official title wins when available so our
+  // panel follows the right-side Cursor conversation list. Otherwise a manual
+  // local rename wins; then the auto-title derived from the first instruction.
   const displayName = (indexItem.nameManual && indexItem.name)
-    ? indexItem.name
-    : (indexItem.autoTitle || indexItem.name || sp.id);
+    ? (officialTitle || indexItem.name)
+    : (officialTitle || indexItem.autoTitle || indexItem.name || sp.id);
   return {
     id: sp.id,
     name: displayName,
+    displaySeq: sessionDisplaySeq(indexItem, index),
     baseName: indexItem.name || sp.id,
     autoTitled: Boolean(!indexItem.nameManual && indexItem.autoTitle),
     created_at: indexItem.created_at || "",
     state: status.state || "new",
+    transport: status.transport || (presence && presence.mode) || "",
     connected,
     activity,
     interruptReason,
@@ -110,8 +127,10 @@ function sessionSummary(paths, indexItem, settings = readSettings(paths)) {
     // Auto-captured by the waiter from the agent terminal's CURSOR_* env vars.
     // conversationId is Cursor's own chat id (the "request id" the user means),
     // surfaced so the panel can show/copy it with no manual entry.
-    conversationId: status.conversation_id || "",
-    conversationShort: status.conversation_id ? String(status.conversation_id).slice(0, 8) : "",
+    conversationId,
+    conversationShort: conversationId ? String(conversationId).slice(0, 8) : "",
+    officialTitle,
+    titleSource: officialTitle ? "cursor" : (indexItem.nameManual ? "manual" : (indexItem.autoTitle ? "auto" : "default")),
     workspaceLabel: status.workspace_label || "",
     lastMessagePreview: compactForUi(status.last_message_preview || "", 160),
     lastResult: compactForUi(status.last_result || "", 240),
@@ -145,7 +164,7 @@ function getAllSessions(paths, settings = readSettings(paths)) {
   if (cached && cached.sig === sig && now - cached.at < ALL_SESSIONS_TTL_MS) {
     return cached.data;
   }
-  const data = readSessionsIndex(paths).sessions.map((item) => sessionSummary(paths, item, settings));
+  const data = readSessionsIndex(paths).sessions.map((item, index) => sessionSummary(paths, item, settings, index));
   _allSessionsCache.set(paths.stateDir, { sig, at: now, data });
   return data;
 }

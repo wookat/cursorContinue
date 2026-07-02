@@ -9,11 +9,15 @@
     selectedSessionId: "",
     globalQueue: [],
     events: [],
+    persistedEvents: [],
+    sessionDetail: null,
     thumbs: {},
     thumbReq: {},
     lastSchedulingMode: undefined,
+    targetTouched: false,
     lastRenderSig: "",
   };
+  const INLINE_QUEUE_PREVIEW_LIMIT = 6;
 
   const $ = (id) => document.getElementById(id);
   const send = (type, extra = {}) => vscode.postMessage({ type, ...extra });
@@ -97,6 +101,26 @@
     return state.sessions.find((session) => session.id === state.selectedSessionId) || state.sessions[0] || null;
   }
 
+  function transportLabel(session) {
+    return session && session.transport ? String(session.transport).toUpperCase() : "未连接";
+  }
+
+  function sessionSeq(session, index) {
+    if (session && Number.isFinite(Number(session.displaySeq))) return Number(session.displaySeq);
+    const match = /^agent-(\d+)/.exec(String((session && session.id) || ""));
+    return match ? Number(match[1]) : index + 1;
+  }
+
+  function setSelectedSessionLabel() {
+    const selected = selectedSession();
+    if (!selected) {
+      setTextIfChanged($("selectedSessionText"), "当前会话：未选择");
+      return;
+    }
+    const index = state.sessions.findIndex((session) => session.id === selected.id);
+    setTextIfChanged($("selectedSessionText"), `当前会话 ${sessionSeq(selected, index)}：${selected.name}`);
+  }
+
   function formatDuration(ms) {
     const s = Math.max(0, Math.round(Number(ms || 0) / 1000));
     if (s < 60) return `${s}秒`;
@@ -161,9 +185,39 @@
 
     const onlineText = `${status.onlineCount || 0}/${status.maxConcurrentSessions || state.sessions.length || 0}`;
     const onlineClass = `status-pill ${(status.onlineCount || 0) > 0 ? "running" : ""}`;
+    const mcpPill = $("mcpPill");
+    if (mcpPill) {
+      const mcpActive = Number(status.mcpActiveCount || 0);
+      const shellActive = Number(status.shellActiveCount || 0);
+      const mcpText = status.mcpStale
+        ? "MCP stale"
+        : status.mcpInstalled
+        ? (mcpActive > 0 ? `MCP ${mcpActive}` : "MCP ready")
+        : "MCP off";
+      const mcpClass = status.mcpStale
+        ? "meta-chip meta-chip-stale"
+        : status.mcpInstalled
+        ? `meta-chip ${mcpActive > 0 ? "meta-chip-ready" : "meta-chip-waiting"}`
+        : "meta-chip meta-chip-off";
+      setTextIfChanged(mcpPill, shellActive > 0 ? `${mcpText} / shell ${shellActive}` : mcpText);
+      setClassIfChanged(mcpPill, mcpClass);
+      mcpPill.title = status.mcpStale
+        ? `MCP config is stale. Current: ${status.mcpStatus?.server || ""} Expected: ${status.mcpStatus?.expectedServer || ""}`
+        : status.mcpInstalled
+        ? `MCP config: ${status.mcpConfig || ""}`
+        : "MCP config is not installed for this workspace.";
+    }
     setTextIfChanged($("onlinePill"), onlineText);
     setClassIfChanged($("onlinePill"), onlineClass);
-    setTextIfChanged($("queuePill"), `待消费 ${status.totalQueueLength || 0}`);
+    const pending = status.globalQueueLength || 0;
+    const assigned = Math.max(0, (status.totalQueueLength || 0) - pending);
+    setTextIfChanged($("queuePill"), `待分配 ${pending} / 待消费 ${assigned}`);
+    const syncPill = $("syncPill");
+    if (syncPill) {
+      const syncAt = status.syncedAt || new Date().toLocaleTimeString();
+      setTextIfChanged(syncPill, `同步于 ${syncAt}`);
+      syncPill.title = `状态来源：${status.stateDir || ""}`;
+    }
     setTextIfChanged($("workspace"), status.workspaceRoot || status.detail || "等待打开项目");
     setTextIfChanged($("statusText"), status.statusText || "暂无在线会话，请复制启动指令到 Cursor 对话。");
     const patch = status.patch || {};
@@ -175,11 +229,17 @@
     setTextIfChanged($("retryNote"), retryNoteText);
 
     const selected = selectedSession();
-    setTextIfChanged($("selectedSessionText"), selected ? `当前会话：${selected.name}` : "当前会话：未选择");
+    setSelectedSessionLabel();
+    const detail = selected
+      ? `${transportLabel(selected)} · ${sessionStateLabel(selected)} · 队列 ${selected.queueLength || 0}${selected.lastResult ? ` · 最近：${compactText(selected.lastResult, 90)}` : ""}`
+      : "先新建会话；没有在线 MCP 时，也可以先把任务发送到待分配队列。";
+    const detailEl = $("currentSessionDetail");
+    if (detailEl) setTextIfChanged(detailEl, detail);
     // Only sync the composer target from the default scheduling mode when that
     // default actually changes, so an auto-refresh never clobbers a manual pick.
-    if (state.lastSchedulingMode !== state.settings.schedulingMode) {
-      $("targetMode").value = state.settings.schedulingMode || "direct";
+    if (!state.targetTouched || state.lastSchedulingMode !== state.settings.schedulingMode) {
+      const configured = state.settings.schedulingMode || "direct";
+      $("targetMode").value = (status.onlineCount || 0) > 0 ? configured : "idle-first";
       state.lastSchedulingMode = state.settings.schedulingMode;
     }
 
@@ -205,9 +265,11 @@
       s.state,
       s.connected ? 1 : 0,
       s.queueLength || 0,
+      s.displaySeq || "",
       s.lastResultStatus || "",
       s.lastResultAtMs || 0,
       s.connected && s.keepaliveDeadlineMs ? Math.floor(s.keepaliveDeadlineMs / 1000) : 0,
+      s.transport || "",
       s.overrides ? `${s.overrides.keepaliveSeconds || ""}|${s.overrides.waitTimeoutSeconds || ""}|${s.overrides.pollSeconds || ""}` : "",
       s.conversationShort || "",
       s.activity || "",
@@ -237,6 +299,15 @@
     return `${Math.round(hours / 24)}天前`;
   }
 
+  function formatTimestamp(value) {
+    if (!value) return "";
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) {
+      try { return new Date(n).toLocaleString(); } catch { return String(value); }
+    }
+    return String(value);
+  }
+
   function resultBadge(session) {
     if (!session.lastResult) return "";
     const cls = session.lastResultStatus === "error" ? "result-error"
@@ -256,15 +327,18 @@
       _sessionCardCache.clear();
       return;
     }
-    const html = state.sessions.map((session) => sessionCardHtml(session)).join("");
+    const html = state.sessions.map((session, index) => sessionCardHtml(session, index)).join("");
     if (list.innerHTML !== html) list.innerHTML = html;
   }
 
-  function sessionCardHtml(session) {
+  function sessionCardHtml(session, index = 0) {
+    const seq = sessionSeq(session, index);
     const sig = [
       session.id, session.name, session.state, session.connected ? 1 : 0,
       session.queueLength || 0, session.lastResultStatus || "", session.lastResultAtMs || 0,
       session.id === state.selectedSessionId ? 1 : 0,
+      seq,
+      session.transport || "",
       session.overrides ? 1 : 0,
       session.projectDir || "",
       session.conversationShort || "",
@@ -285,11 +359,19 @@
     const projectChip = session.projectDir
       ? `<span class="session-project" title="项目目录：${escapeHtml(session.projectDir)}（本会话只在此目录内工作）">📁 ${escapeHtml(session.projectName || session.projectDir)}</span>`
       : "";
-    const html = `
-      <div class="session-card ${session.id === state.selectedSessionId ? "selected" : ""}${attentionClass(session)}" role="button" tabindex="0" aria-label="会话 ${escapeHtml(session.name || session.id)}" data-session-id="${escapeHtml(session.id)}">
+    const transportChip = session.transport
+      ? `<span class="session-transport session-transport-${escapeHtml(session.transport)}" title="Transport: ${escapeHtml(session.transport)}">${escapeHtml(String(session.transport).toUpperCase())}</span>`
+      : "";
+    // Show a short title only when the name is not the default "会话 N" pattern
+    // (the session-seq badge already covers that). Limit to 6 chars so prompt
+    // text does not overflow the card.
+    const rawTitle = session.name || "";
+    const isDefaultName = /^会话\s*\d+$/.test(rawTitle.trim());
+    const shortTitle = (!isDefaultName && rawTitle) ? rawTitle.slice(0, 6) : "";
+    const html = `<div class="session-card ${session.id === state.selectedSessionId ? "selected" : ""}${attentionClass(session)}" role="button" tabindex="0" aria-label="会话 ${escapeHtml(session.name || session.id)}" data-session-id="${escapeHtml(session.id)}">
         <span class="${sessionDotClass(session)}"></span>
         <span class="session-main">
-          <span class="session-name">${escapeHtml(session.name || session.id)}${session.overrides ? ' <span class="session-override" title="使用自定义参数">⚙</span>' : ""}${cidChip}${projectChip}</span>
+          <span class="session-name"><span class="session-seq">会话 ${escapeHtml(seq)}</span>${escapeHtml(shortTitle)}${session.overrides ? ' <span class="session-override" title="使用自定义参数">⚙</span>' : ""}${transportChip}${cidChip}${projectChip}</span>
           <span class="session-meta ${session.activity === "working" ? "meta-working" : session.activity === "stalled" ? "meta-stalled" : ""}">${escapeHtml(sessionStateLabel(session))}</span>
           ${resultBadge(session)}
         </span>
@@ -304,6 +386,8 @@
 
   function syncSettingsInputs() {
     $("setMaxSessions").value = state.settings.maxConcurrentSessions ?? 4;
+    $("setPerSessionQueueLimit").value = state.settings.perSessionQueueLimit ?? 20;
+    $("setGlobalQueueLimit").value = state.settings.globalQueueLimit ?? 100;
     $("setSchedulingMode").value = state.settings.schedulingMode ?? "direct";
     $("setKeepalive").value = state.settings.keepaliveSeconds ?? 300;
     $("setNotifyOnAttention").checked = state.settings.notifyOnAttention !== false;
@@ -390,7 +474,7 @@
           <div class="queued-text">${escapeHtml(compactText(payload.user_input || "仅附件消息", 160))}</div>
           ${thumbs ? `<div class="queued-thumbs">${thumbs}</div>` : ""}
           <div class="queued-meta-row">
-            <span class="queued-tag">${escapeHtml(scope === "global" ? "空闲优先" : sessionId)}</span>
+            <span class="queued-tag">${escapeHtml(scope === "global" ? "待分配" : sessionId)}</span>
             <span class="queued-tag">${escapeHtml(entry.source || "panel")}</span>
             ${tagsHtml}
             <span class="queued-spacer"></span>
@@ -421,14 +505,14 @@
   function allQueueItemsHtml() {
     const parts = [];
     if (state.globalQueue.length) {
-      parts.push(`<div class="queued-section-title">空闲优先队列</div>${state.globalQueue.map((entry) => queueItemHtml(entry, "", "global")).join("")}`);
+      parts.push(`<div class="queued-section-title">待分配队列</div>${state.globalQueue.map((entry) => queueItemHtml(entry, "", "global")).join("")}`);
     }
     for (const session of state.sessions) {
       if (session.queuedResponses && session.queuedResponses.length) {
         parts.push(`<div class="queued-section-title">${escapeHtml(session.name || session.id)}</div>${session.queuedResponses.map((entry) => queueItemHtml(entry, session.id, "session")).join("")}`);
       }
     }
-    return parts.length ? parts.join("") : '<div class="meta-hint">暂无待消费消息。</div>';
+    return parts.length ? parts.join("") : '<div class="meta-hint">暂无待分配或待消费消息。</div>';
   }
 
   function renderQueue() {
@@ -444,18 +528,22 @@
       if ($("queued-root").innerHTML) $("queued-root").innerHTML = "";
       return;
     }
-    const inlineSig = `${state.globalQueue.length}|${selectedQueue.length}|${selected?.id || ""}`;
+    const globalPreview = state.globalQueue.slice(0, INLINE_QUEUE_PREVIEW_LIMIT);
+    const sessionPreview = selectedQueue.slice(0, INLINE_QUEUE_PREVIEW_LIMIT);
+    const hiddenCount = Math.max(0, state.globalQueue.length - globalPreview.length) + Math.max(0, selectedQueue.length - sessionPreview.length);
+    const inlineSig = `${state.globalQueue.map((entry) => entry.id).join(",")}|${selectedQueue.map((entry) => entry.id).join(",")}|${selected?.id || ""}|${hiddenCount}`;
     if (state._lastInlineQueueSig === inlineSig && $("queued-root").innerHTML) return;
     state._lastInlineQueueSig = inlineSig;
     $("queued-root").innerHTML = `
       <section class="queued-section">
         <div class="queued-section-head">
-          <div class="queued-section-title">待消费队列：全局 ${state.globalQueue.length} / 当前 ${selectedQueue.length}</div>
+          <div class="queued-section-title">队列：待分配 ${state.globalQueue.length} / 当前会话 ${selectedQueue.length}</div>
           <button class="mini-button" id="inlineQueueOpen">展开</button>
         </div>
         <div class="queued-list">
-          ${state.globalQueue.slice(0, 2).map((entry) => queueItemHtml(entry, "", "global")).join("")}
-          ${selectedQueue.slice(0, 2).map((entry) => queueItemHtml(entry, selected.id, "session")).join("")}
+          ${globalPreview.map((entry) => queueItemHtml(entry, "", "global")).join("")}
+          ${sessionPreview.map((entry) => queueItemHtml(entry, selected.id, "session")).join("")}
+          ${hiddenCount ? `<div class="queued-more">还有 ${hiddenCount} 条未在此处显示，点“展开”查看全部。</div>` : ""}
         </div>
       </section>
     `;
@@ -474,15 +562,33 @@
         ? latest.map((entry) => `<div class="event-line">[${escapeHtml(entry.at)}] ${escapeHtml(entry.text)}</div>`).join("")
         : '<div class="event-line">保活说明：等待超过保活间隔后，Agent 会收到 KEEPALIVE_NOOP 并重新运行 wait。</div>';
     }
-    if (!$("eventDialog").classList.contains("hidden")) {
-      const historySig = state.events.length;
-      if (historySig !== state._lastHistorySig) {
-        state._lastHistorySig = historySig;
-        $("eventHistoryList").innerHTML = state.events.length
-          ? state.events.map((entry) => `<div class="history-entry"><div class="history-time">${escapeHtml(entry.at)}</div><div class="history-text">${escapeHtml(entry.text)}</div></div>`).join("")
-          : '<div class="meta-hint">暂无执行记录。</div>';
-      }
-    }
+    renderEventHistoryIfOpen();
+  }
+
+  function persistentEventText(item) {
+    if (!item || typeof item !== "object") return "";
+    if (item.type === "queued_global") return `加入待分配队列：${compactText(item.payload?.user_input || item.message || "", 160)}`;
+    if (item.type === "queued_session") return `加入会话队列 ${item.session_id || ""}：${compactText(item.payload?.user_input || item.message || "", 160)}`;
+    if (item.type === "received") return `${item.session_id || ""} 已领取任务：${compactText(item.message_preview || "", 160)}`;
+    if (item.type === "result") return `${item.session_id || ""} 上报 ${item.status || "done"}：${compactText(item.summary || item.summary_preview || "", 160)}`;
+    if (item.type === "handoff") return `会话转接：${item.source || ""} → ${item.target || ""}`;
+    if (item.type === "global_queue_cleared") return "已清空待分配队列";
+    return `${item.type || "event"} ${compactText(JSON.stringify(item), 180)}`;
+  }
+
+  function renderEventHistoryIfOpen() {
+    const dialog = $("eventDialog");
+    if (!dialog || dialog.classList.contains("hidden")) return;
+    const rows = [
+      ...state.events.map((entry) => ({ at: entry.at, text: entry.text, live: true })),
+      ...state.persistedEvents.map((item) => ({ at: item.at || item.created_at || item.received_at || "", text: persistentEventText(item), live: false })),
+    ].filter((entry) => entry.text);
+    const historySig = rows.map((entry) => `${entry.at}|${entry.text}`).join("\u0001");
+    if (historySig === state._lastHistorySig) return;
+    state._lastHistorySig = historySig;
+    $("eventHistoryList").innerHTML = rows.length
+      ? rows.map((entry) => `<div class="history-entry${entry.live ? " live-event" : ""}"><div class="history-time">${escapeHtml(entry.at || "")}${entry.live ? " · 面板事件" : ""}</div><div class="history-text">${escapeHtml(entry.text)}</div></div>`).join("")
+      : '<div class="meta-hint">暂无执行记录。复制指令、安装 MCP、发送入队或 Agent 消费任务后都会显示在这里。</div>';
   }
 
   function renderTimeline(items) {
@@ -496,6 +602,62 @@
         return `<div class="history-entry"><div class="history-time">${escapeHtml(item.at || "")} · ${escapeHtml(name)} · <span class="${cls}">${escapeHtml(item.status || "done")}</span></div><div class="history-text">${escapeHtml(compactText(text, 400))}</div></div>`;
       }).join("")
       : '<div class="meta-hint">暂无结果记录。</div>';
+  }
+
+  function detailMessageHtml(message) {
+    const role = message.type === "user" ? "用户" : message.type === "assistant" ? "AI" : "其他";
+    const extras = [
+      message.hasToolResults ? "工具" : "",
+      message.hasCodeBlocks ? "代码" : "",
+      message.hasDiffs ? "diff" : "",
+    ].filter(Boolean).join(" / ");
+    return `<div class="detail-message detail-${escapeHtml(message.type || "other")}">
+      <div class="detail-message-head"><span>${escapeHtml(role)}</span><span>${escapeHtml(formatTimestamp(message.createdAt))}</span>${extras ? `<span>${escapeHtml(extras)}</span>` : ""}</div>
+      <pre class="detail-message-text">${escapeHtml(message.text || "")}</pre>
+    </div>`;
+  }
+
+  function renderSessionDetail(detail) {
+    state.sessionDetail = detail || null;
+    const dialog = $("sessionDetailDialog");
+    if (!dialog) return;
+    const session = detail?.session || {};
+    const conv = detail?.conversation || null;
+    const title = conv?.name || session.officialTitle || session.name || detail?.sessionId || "";
+    setTextIfChanged($("sessionDetailTitle"), title ? `会话详情：${title}` : "会话详情");
+    const meta = [
+      detail?.sessionId ? `本地 ID：${detail.sessionId}` : "",
+      detail?.conversationId ? `Cursor ID：${detail.conversationId}` : "",
+      conv ? `官方消息：${conv.messageCount || conv.messages?.length || 0} 条` : "",
+      session.transport ? `模式：${String(session.transport).toUpperCase()}` : "",
+      session.titleSource ? `标题来源：${session.titleSource}` : "",
+    ].filter(Boolean).join(" · ");
+    setTextIfChanged($("sessionDetailMeta"), meta || "未找到 Cursor 官方会话，显示本地桥接记录。");
+
+    const officialHtml = conv && conv.messages && conv.messages.length
+      ? conv.messages.map(detailMessageHtml).join("")
+      : '<div class="meta-hint">没有读取到 Cursor 官方完整回复。可能是 Cursor 数据库不可读、当前是远程窗口，或该会话还没有写入历史。</div>';
+    const localHtml = detail?.localHistory?.length
+      ? detail.localHistory.slice().reverse().map((item) => `<div class="history-entry"><div class="history-time">${escapeHtml(item.at || item.type || "")}</div><pre class="history-text detail-local-text">${escapeHtml(item.text || "")}</pre></div>`).join("")
+      : '<div class="meta-hint">暂无本地桥接历史。</div>';
+    $("sessionDetailBody").innerHTML = `
+      <section class="detail-section">
+        <div class="advanced-title">Cursor 官方对话</div>
+        <div class="detail-message-list">${officialHtml}</div>
+      </section>
+      <section class="detail-section">
+        <div class="advanced-title">本地桥接记录</div>
+        <div class="event-history-list">${localHtml}</div>
+      </section>
+    `;
+  }
+
+  function openSessionDetail(sessionId) {
+    const sid = sessionId || state.selectedSessionId;
+    if (!sid) return;
+    renderSessionDetail({ sessionId: sid, session: (state.sessions || []).find((s) => s.id === sid), localHistory: [] });
+    openModal("sessionDetailDialog");
+    send("requestSessionDetail", { sessionId: sid });
   }
 
   function submit() {
@@ -513,6 +675,9 @@
       targetMode: $("targetMode").value,
       sessionId: state.selectedSessionId,
     });
+    state.events.unshift({ at: new Date().toLocaleTimeString(), text: $("targetMode").value === "idle-first" ? "已提交到待分配队列，等待空闲 MCP 会话领取。" : "已提交到队列，等待 Agent 下一次 wait 消费。" });
+    if (state.events.length > 100) state.events.length = 100;
+    renderEvents();
     $("instruction").value = "";
     state.draft = { file_paths: [], image_paths: [], folder_paths: [] };
     renderAttachments();
@@ -524,6 +689,8 @@
     send("updateExtensionSettings", {
       settings: {
         maxConcurrentSessions: Number($("setMaxSessions").value || 4),
+        perSessionQueueLimit: Number($("setPerSessionQueueLimit").value || 20),
+        globalQueueLimit: Number($("setGlobalQueueLimit").value || 100),
         schedulingMode: $("setSchedulingMode").value || "direct",
         keepaliveSeconds: Number($("setKeepalive").value || 300),
         notifyOnAttention: $("setNotifyOnAttention").checked,
@@ -645,6 +812,7 @@
   function sessionMenuModel(session) {
     const hasProject = !!(session && session.projectDir);
     const items = [
+      { action: "detail", icon: "☰", label: "查看对话详情…" },
       { action: "handoff", icon: "↪", label: "会话转接…", hint: "交给其它会话" },
       { action: "rename", icon: "✎", label: "重命名会话" },
       // Pin the session to one project folder inside a multi-project workspace so
@@ -679,8 +847,7 @@
     state.selectedSessionId = sessionId;
     renderSessions();
     renderQueue();
-    const selected = selectedSession();
-    setTextIfChanged($("selectedSessionText"), selected ? `当前会话：${selected.name}` : "当前会话：未选择");
+    setSelectedSessionLabel();
   }
 
   function openSessionMenu(sessionId, x, y) {
@@ -720,6 +887,7 @@
     if (!sid) return;
     switch (action) {
       case "handoff": openHandoff(); break;
+      case "detail": openSessionDetail(sid); break;
       case "rename": send("renameSessionPrompt", { sessionId: sid }); break;
       case "setProject": send("pickProject", { sessionId: sid }); break;
       case "clearProject": send("clearProject", { sessionId: sid }); break;
@@ -759,8 +927,14 @@
     $("handoffSource").addEventListener("change", prefillHandoffContext);
     $("handoffTarget").addEventListener("change", updateHandoffHint);
     $("clearGlobalQueue").addEventListener("click", () => send("clearQueue", { scope: "global" }));
-    $("eventHistoryBtn").addEventListener("click", () => { renderEvents(); openModal("eventDialog"); });
-    $("showEventsBtn").addEventListener("click", () => { renderEvents(); openModal("eventDialog"); });
+    const openEvents = () => {
+      openModal("eventDialog");
+      state._lastHistorySig = "";
+      send("requestEventHistory");
+      renderEvents();
+    };
+    $("eventHistoryBtn").addEventListener("click", openEvents);
+    $("showEventsBtn").addEventListener("click", openEvents);
     $("showTimelineBtn").addEventListener("click", () => { renderTimeline([]); send("requestResultTimeline"); openModal("timelineDialog"); });
     $("showQueueBtn").addEventListener("click", () => { openModal("queueDialog"); renderQueue(); });
     $("installPatch").addEventListener("click", () => send("installRetryPatch"));
@@ -768,7 +942,9 @@
     $("saveSettings").addEventListener("click", saveSettings);
     const testWebhookBtn = $("testWebhookBtn");
     if (testWebhookBtn) testWebhookBtn.addEventListener("click", () => send("testWebhook", { url: ($("setWebhookUrl").value || "").trim() }));
+    $("targetMode").addEventListener("change", () => { state.targetTouched = true; });
     $("pickFiles").addEventListener("click", () => send("pickFiles"));
+    $("pickFolders").addEventListener("click", () => send("pickFolders"));
     $("pickEditor").addEventListener("click", () => send("pickActiveEditor"));
     $("pickWorkspace").addEventListener("click", () => send("pickWorkspaceFolder"));
     $("sessionList").addEventListener("click", (event) => {
@@ -804,7 +980,7 @@
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         closeSessionMenu();
-        ["moreDialog", "settingsDialog", "eventDialog", "queueDialog", "timelineDialog", "sessionSettingsDialog", "handoffDialog"].forEach(closeModal);
+        ["moreDialog", "settingsDialog", "eventDialog", "queueDialog", "timelineDialog", "sessionSettingsDialog", "handoffDialog", "sessionDetailDialog"].forEach(closeModal);
       }
     });
     window.addEventListener("paste", (event) => {
@@ -901,7 +1077,14 @@
 
   window.addEventListener("message", (event) => {
     const data = event.data || {};
-    if (data.type === "filesPicked") addPaths(data.paths || [], data.kind);
+    if (data.type === "filesPicked") {
+      if (data.filePaths || data.folderPaths) {
+        addPaths(data.filePaths || []);
+        addPaths(data.folderPaths || [], "folder");
+      } else {
+        addPaths(data.paths || [], data.kind);
+      }
+    }
     if (data.type === "pastedImageSaved") addPaths([data.path]);
     if (data.type === "thumb" && data.path) {
       state.thumbs[data.path] = data.dataUrl;
@@ -915,6 +1098,12 @@
       }
     }
     if (data.type === "resultTimeline") renderTimeline(data.items || []);
+    if (data.type === "eventHistory") {
+      state.persistedEvents = data.items || [];
+      state._lastHistorySig = "";
+      renderEventHistoryIfOpen();
+    }
+    if (data.type === "sessionDetail") renderSessionDetail(data.detail || {});
     if (data.type === "conversationBrief" && data.brief) {
       // Full conversation history arrived from the extension host — replace the
       // lightweight preview in the handoff textarea with the real context.
@@ -940,8 +1129,7 @@
         state.selectedSessionId = data.sessionId;
         renderSessions();
         renderQueue();
-        const selected = selectedSession();
-        setTextIfChanged($("selectedSessionText"), selected ? `当前会话：${selected.name}` : "当前会话：未选择");
+        setSelectedSessionLabel();
       }
     }
     if (data.type === "status") renderStatus(data.status || {});

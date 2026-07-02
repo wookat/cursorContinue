@@ -251,7 +251,7 @@ class ProjectState {
     let item;
     try {
       const queue = this.readGlobalQueue();
-      const limit = Number(this.settings().globalQueueLimit || 20) || 20;
+      const limit = Number(this.settings().globalQueueLimit || DEFAULT_SETTINGS.globalQueueLimit) || DEFAULT_SETTINGS.globalQueueLimit;
       if (queue.length >= limit) throw new Error(`空闲优先队列已达到上限 ${limit}。`);
       item = makeQueueItem(payload, source, "idle-first");
       queue.push(item);
@@ -370,7 +370,7 @@ class SessionState {
     let item;
     try {
       const queue = this.queue();
-      const limit = Number(this.project.settings().perSessionQueueLimit || 3) || 3;
+      const limit = Number(this.project.settings().perSessionQueueLimit || DEFAULT_SETTINGS.perSessionQueueLimit) || DEFAULT_SETTINGS.perSessionQueueLimit;
       if (queue.length >= limit) throw new Error(`${this.sessionId} 的队列已达到上限 ${limit}。`);
       item = makeQueueItem(payload, source, this.sessionId);
       queue.push(item);
@@ -523,6 +523,7 @@ class SessionState {
       name: indexItem.name || this.sessionId,
       created_at: indexItem.created_at,
       state: status.state || "new",
+      transport: status.transport || "",
       connected,
       heartbeat_age_ms: heartbeatAgeMs,
       queue_length: status.queue_length || 0,
@@ -825,7 +826,7 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
   }
   const [acquired, owner] = session.acquireWaiter(runId);
   if (!acquired) {
-    session.writeStatus(runId, "busy", { last_error: "another waiter is already active", active_waiter: owner });
+    session.writeStatus(runId, "busy", { transport: "shell", last_error: "another waiter is already active", active_waiter: owner });
     console.log(sessionBusyMessage(sessionId, owner && owner.pid));
     return 3;
   }
@@ -843,6 +844,7 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
   // every later heartbeat write.
   const agentEnv = captureAgentEnv();
   session.writeStatus(runId, "waiting", {
+    transport: "shell",
     started_at: isoNow(),
     last_ack_id: null,
     keepalive_deadline_ms: keepaliveDeadline,
@@ -914,7 +916,7 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
       }
       if (now - lastHeartbeat >= heartbeatInterval) {
         session.refreshWaiter(runId);
-        session.writeStatus(runId, "waiting", { uptime_ms: nowMs() - startedAtMs, keepalive_deadline_ms: keepaliveDeadline });
+        session.writeStatus(runId, "waiting", { transport: "shell", uptime_ms: nowMs() - startedAtMs, keepalive_deadline_ms: keepaliveDeadline });
         lastHeartbeat = now;
       }
 
@@ -969,6 +971,7 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
         session.appendHistory({ type: "received", ...ack });
         project.appendHistory({ type: "received", ...ack });
         session.writeStatus(runId, "received", {
+          transport: "shell",
           last_ack_id: ack.id,
           last_ack_at: ack.received_at,
           last_message_preview: ack.message_preview,
@@ -981,7 +984,7 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
       }
 
       if (deadline !== null && Date.now() >= deadline) {
-        session.writeStatus(runId, "timeout", { uptime_ms: nowMs() - startedAtMs });
+        session.writeStatus(runId, "timeout", { transport: "shell", uptime_ms: nowMs() - startedAtMs });
         clearSpinner();
         console.log("timeout waiting for instruction");
         return 2;
@@ -989,7 +992,7 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
 
       if (keepaliveDeadline !== null && Date.now() >= keepaliveDeadline) {
         session.appendHistory({ type: "keepalive", session_id: sessionId, run_id: runId, at: isoNow() });
-        session.writeStatus(runId, "keepalive", { last_message_preview: "KEEPALIVE_NOOP", uptime_ms: nowMs() - startedAtMs });
+        session.writeStatus(runId, "keepalive", { transport: "shell", last_message_preview: "KEEPALIVE_NOOP", uptime_ms: nowMs() - startedAtMs });
         const rerunCmd = buildRerunCmd(project, sessionId, timeoutSeconds, keepaliveSeconds, pollSeconds, report, reportStatus);
         clearSpinner();
         process.stdout.write(`${keepaliveMessage(sessionId, rerunCmd)}\n`);
@@ -1021,12 +1024,8 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
 function timeSubprocess(cmd, args) {
   const start = process.hrtime.bigint();
   let result;
-  // A bare command name (node) needs shell PATH/PATHEXT resolution on Windows;
-  // an absolute path (process.execPath, which may contain spaces) must NOT go
-  // through the shell or the space breaks the command.
-  const useShell = process.platform === "win32" && !path.isAbsolute(cmd);
   try {
-    result = spawnSync(cmd, args, { encoding: "utf8", timeout: 60000, shell: useShell });
+    result = spawnSync(cmd, args, { encoding: "utf8", timeout: 60000, shell: false });
   } catch (error) {
     return { ok: false, ms: null, error: error.message, out: "" };
   }

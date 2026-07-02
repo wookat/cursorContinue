@@ -22,8 +22,8 @@ function normalizeSettings(settings) {
   settings.offlineAfterSeconds = Math.max(5, Number(settings.offlineAfterSeconds || 15));
   settings.workingTimeoutSeconds = Math.max(30, Number(settings.workingTimeoutSeconds || 300) || 300);
   settings.maxConcurrentSessions = Math.max(1, Number(settings.maxConcurrentSessions || 4));
-  settings.perSessionQueueLimit = Math.max(1, Number(settings.perSessionQueueLimit || 3));
-  settings.globalQueueLimit = Math.max(1, Number(settings.globalQueueLimit || 20));
+  settings.perSessionQueueLimit = Math.max(1, Number(settings.perSessionQueueLimit || DEFAULT_SETTINGS.perSessionQueueLimit));
+  settings.globalQueueLimit = Math.max(1, Number(settings.globalQueueLimit || DEFAULT_SETTINGS.globalQueueLimit));
   settings.pollSeconds = Math.max(0.1, Number(settings.pollSeconds || 0.2));
   settings.historyLimit = Math.max(20, Number(settings.historyLimit || 200));
   settings.imageLimit = Math.max(5, Number(settings.imageLimit || 50));
@@ -40,6 +40,12 @@ function normalizeSettings(settings) {
 function readSettings(paths) {
   const raw = readJsonCached(paths.settings, {});
   const settings = { ...DEFAULT_SETTINGS, ...(raw && typeof raw === "object" ? raw : {}) };
+  if (!raw || typeof raw !== "object" || raw.perSessionQueueLimit == null || Number(raw.perSessionQueueLimit) === 3) {
+    settings.perSessionQueueLimit = DEFAULT_SETTINGS.perSessionQueueLimit;
+  }
+  if (!raw || typeof raw !== "object" || raw.globalQueueLimit == null || Number(raw.globalQueueLimit) === 20) {
+    settings.globalQueueLimit = DEFAULT_SETTINGS.globalQueueLimit;
+  }
   return normalizeSettings(settings);
 }
 

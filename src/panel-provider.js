@@ -15,7 +15,7 @@ const path = require("path");
 
 const shared = require("../runtime/shared.js");
 const { DEFAULT_SETTINGS, normalizePayload, safeSessionId, compactForUi } = shared;
-const { ensureRuntime, getPaths } = require("./paths.js");
+const { ensureRuntime, getPaths, sessionPaths } = require("./paths.js");
 const { readSettings, saveSettings } = require("./settings.js");
 const {
   registerSession, removeSession, setSessionOverrides, renameSession,
@@ -28,14 +28,14 @@ const {
   getAllSessions, dispatchPayload, handoffSession,
 } = require("./session-status.js");
 const { readHistory } = require("./history.js");
-const { buildHandoffBrief, readConversation } = require("./cursor-history.js");
+const { buildHandoffBrief, readConversation, findConversationBySessionId } = require("./cursor-history.js");
 const { savePastedImage, readImageThumb } = require("./image-utils.js");
 const {
   copySmartInstruction, copyAgentInstruction, copyMcpInstruction,
   startWaitTerminal, startDoctorTerminal, installMcpConfig, installRule,
-  mcpInstalled,
+  mcpConfigStatus,
 } = require("./instruction-builder.js");
-const { pickFiles, pickFolders, pickProjectFolder, pickActiveEditor } = require("./pickers.js");
+const { pickFiles, pickFolders, pickAttachmentPaths, pickProjectFolder, pickActiveEditor } = require("./pickers.js");
 const { patchStatusWithNative, installRetryPatch, uninstallRetryPatch } = require("./retry-patch.js");
 const { getChannelToken, LocalChannel } = require("./local-channel.js");
 const { panelHtml } = require("./panel-html.js");
@@ -63,13 +63,24 @@ function getBridgeStatus(context, options = {}) {
   const globalQueue = readQueue(paths.globalQueue);
   let totalQueueLength = globalQueue.length;
   let onlineCount = 0;
+  let mcpActiveCount = 0;
+  let shellActiveCount = 0;
   for (let i = 0; i < sessions.length; i++) {
     totalQueueLength += sessions[i].queueLength;
     if (sessions[i].connected) onlineCount++;
+    const isLive = sessions[i].connected || sessions[i].activity === "working";
+    if (isLive && sessions[i].transport === "mcp") mcpActiveCount++;
+    if (isLive && sessions[i].transport === "shell") shellActiveCount++;
   }
+  const mcpStatus = mcpConfigStatus(paths);
+  const syncedAtDate = new Date();
   return {
     workspaceRoot: paths.workspaceRoot,
     stateDir: paths.stateDir,
+    syncedAt: syncedAtDate.toLocaleTimeString(),
+    syncedAtMs: syncedAtDate.getTime(),
+    mcpConfig: paths.mcpConfig,
+    mcpServer: paths.mcpServerJs,
     sessions,
     globalQueueLength: globalQueue.length,
     globalQueuedResponses: globalQueue.map((item) => {
@@ -86,11 +97,72 @@ function getBridgeStatus(context, options = {}) {
     totalQueueLength,
     onlineCount,
     maxConcurrentSessions: settings.maxConcurrentSessions,
-    statusText: onlineCount > 0 ? `在线会话 ${onlineCount}/${sessions.length}` : "暂无在线会话，请复制启动指令到 Cursor 对话",
+    statusText: onlineCount > 0
+      ? `MCP 会话已就绪：${mcpActiveCount}/${settings.maxConcurrentSessions}，待分配 ${globalQueue.length}`
+      : `暂无在线 MCP 会话，待分配 ${globalQueue.length} 条；可先录入任务，Agent 连接后会自动领取。`,
     extensionSettings: settings,
     patch: patchStatusWithNative(context, options.forcePatch),
     remoteName: vscode.env.remoteName || "",
-    mcpInstalled: mcpInstalled(paths),
+    mcpInstalled: mcpStatus.installed,
+    mcpCurrent: mcpStatus.current,
+    mcpStale: mcpStatus.stale,
+    mcpStatus,
+    mcpActiveCount,
+    shellActiveCount,
+  };
+}
+
+function capDetailText(value, limit = 30000) {
+  const text = String(value || "");
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n…[内容过长，已截断 ${text.length - limit} 字符]`;
+}
+
+function localHistoryText(item) {
+  if (!item || typeof item !== "object") return "";
+  const payloadText = item.payload && item.payload.user_input ? item.payload.user_input : (item.message || "");
+  if (item.type === "queued") return `面板入队：${payloadText}`;
+  if (item.type === "received") return `Agent 领取：${item.message_preview || ""}`;
+  if (item.type === "result") return `Agent 上报 ${item.status || "done"}：${item.summary || item.summary_preview || ""}`;
+  if (item.type === "keepalive") return "MCP/shell 保活：KEEPALIVE_NOOP";
+  if (item.type === "raw") return item.text || "";
+  return `${item.type || "event"} ${JSON.stringify(item)}`;
+}
+
+function buildSessionDetail(paths, sessionId) {
+  const id = safeSessionId(sessionId || "agent-1");
+  const settings = readSettings(paths);
+  const session = getAllSessions(paths, settings).find((entry) => entry.id === id) || null;
+  const foundBySession = session && session.conversationId ? null : findConversationBySessionId(id);
+  const conversationId = (session && session.conversationId) || (foundBySession && foundBySession.composerId) || "";
+  const conv = conversationId ? readConversation(conversationId) : null;
+  const localItems = readHistory(sessionPaths(paths, id).history, 300);
+  return {
+    session,
+    sessionId: id,
+    conversationId,
+    conversation: conv ? {
+      composerId: conv.composerId,
+      name: conv.name || "",
+      createdAt: conv.createdAt || 0,
+      lastUpdatedAt: conv.lastUpdatedAt || 0,
+      messageCount: conv.messageCount || conv.messages.length,
+      messages: (conv.messages || []).slice(-120).map((message, index) => ({
+        index,
+        type: message.type || "other",
+        text: capDetailText(message.text),
+        createdAt: message.createdAt || 0,
+        hasToolResults: Boolean(message.hasToolResults),
+        hasCodeBlocks: Boolean(message.hasCodeBlocks),
+        hasDiffs: Boolean(message.hasDiffs),
+      })),
+    } : null,
+    localHistory: localItems.map((item, index) => ({
+      index,
+      at: item.at || item.created_at || item.received_at || "",
+      type: item.type || "event",
+      text: capDetailText(localHistoryText(item), 8000),
+    })).filter((item) => item.text),
   };
 }
 
@@ -338,7 +410,14 @@ class PanelProvider {
       for (const it of items) {
         if (it && it.target && it.target !== "idle-first") maybeSetAutoTitle(paths, it.target, payload.user_input);
       }
-      this.event(`已入队 ${items.length} 条消息。`);
+      const label = message.targetMode === "idle-first"
+        ? "已加入待分配队列；下一个空闲 MCP 会话进入 wait 后会自动领取。"
+        : message.targetMode === "broadcast"
+          ? `已广播入队 ${items.length} 条消息。`
+          : message.targetMode === "round-robin"
+            ? `已按轮询策略入队 ${items.length} 条消息。`
+            : `已加入当前会话队列（${message.sessionId || "agent-1"}）。`;
+      this.event(label);
     } else if (message.type === "stop") {
       enqueueToSession(paths, message.sessionId || "agent-1", { status: "stop", user_input: "stop" }, "panel-stop");
       this.event("已发送停止指令。");
@@ -349,6 +428,8 @@ class PanelProvider {
       // Panel requests a full conversation brief for the handoff textarea prefill.
       const brief = buildHandoffBrief(String(message.composerId || ""));
       this.reply({ type: "conversationBrief", brief, composerId: message.composerId });
+    } else if (message.type === "requestSessionDetail") {
+      this.reply({ type: "sessionDetail", detail: buildSessionDetail(paths, message.sessionId || "agent-1") });
     } else if (message.type === "clearQueue") {
       clearQueue(paths, message.scope || "session", message.sessionId || "agent-1");
       this.event("已清空队列。");
@@ -358,6 +439,9 @@ class PanelProvider {
     } else if (message.type === "moveQueued") {
       const moved = moveQueued(paths, message.sessionId || "agent-1", String(message.id || ""), message.direction === "up" ? "up" : "down", message.scope || "session");
       if (!moved) this.event("无法移动该消息（已在顶部/底部）。");
+    } else if (message.type === "pickAttachments") {
+      const picked = await pickAttachmentPaths();
+      this.reply({ type: "filesPicked", filePaths: picked.filePaths, folderPaths: picked.folderPaths });
     } else if (message.type === "pickFiles") {
       this.reply({ type: "filesPicked", paths: await pickFiles() });
     } else if (message.type === "pickFolders") {
@@ -380,6 +464,9 @@ class PanelProvider {
     } else if (message.type === "requestResultTimeline") {
       const items = readHistory(paths.history, 300).filter((record) => record && record.type === "result").slice(-120).reverse();
       this.reply({ type: "resultTimeline", items });
+    } else if (message.type === "requestEventHistory") {
+      const items = readHistory(paths.history, 300).slice(-180).reverse();
+      this.reply({ type: "eventHistory", items });
     } else if (message.type === "updateExtensionSettings") {
       this.reply({ type: "extensionSettingsSaved", settings: saveSettings(this.context, message.settings || {}) });
       this.event("设置已保存。");

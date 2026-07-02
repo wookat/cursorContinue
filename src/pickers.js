@@ -1,21 +1,51 @@
 "use strict";
 
-// ---------------------------------------------------------------------------
-// pickers — VS Code file/folder picker dialogs and active-editor helper.
 // Thin wrappers around vscode.window.showOpenDialog / activeTextEditor.
-// ---------------------------------------------------------------------------
 
 const vscode = require("vscode");
+const fs = require("fs");
 
 async function pickFiles() {
-  const uris = await vscode.window.showOpenDialog({ title: "选择要引用的文件或文件夹", canSelectFiles: true, canSelectFolders: true, canSelectMany: true });
+  const uris = await vscode.window.showOpenDialog({
+    title: "选择要引用的文件",
+    canSelectFiles: true,
+    canSelectFolders: false,
+    canSelectMany: true,
+    openLabel: "引用文件",
+  });
   return (uris || []).map((uri) => uri.fsPath);
 }
 
 async function pickFolders() {
-  // Kept for backward compatibility — now delegates to pickFiles since the
-  // merged picker already allows folder selection.
-  return pickFiles();
+  const uris = await vscode.window.showOpenDialog({
+    title: "选择要引用的文件夹",
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: true,
+    openLabel: "引用文件夹",
+  });
+  return (uris || []).map((uri) => uri.fsPath);
+}
+
+async function pickAttachmentPaths() {
+  const uris = await vscode.window.showOpenDialog({
+    title: "选择要引用的文件或文件夹",
+    canSelectFiles: true,
+    canSelectFolders: true,
+    canSelectMany: true,
+    openLabel: "引用",
+  });
+  const result = { filePaths: [], folderPaths: [] };
+  for (const uri of uris || []) {
+    const fsPath = uri.fsPath;
+    try {
+      if (fs.statSync(fsPath).isDirectory()) result.folderPaths.push(fsPath);
+      else result.filePaths.push(fsPath);
+    } catch {
+      result.filePaths.push(fsPath);
+    }
+  }
+  return result;
 }
 
 async function pickProjectFolder(paths) {
@@ -39,6 +69,7 @@ function pickActiveEditor() {
 module.exports = {
   pickFiles,
   pickFolders,
+  pickAttachmentPaths,
   pickProjectFolder,
   pickActiveEditor,
 };

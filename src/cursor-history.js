@@ -17,6 +17,11 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
+const META_CACHE_TTL_MS = 5000;
+const SESSION_LOOKUP_CACHE_TTL_MS = 10000;
+const metaCache = new Map();
+const sessionLookupCache = new Map();
+
 function cursorGlobalDbPath() {
   // Windows: %APPDATA%\Cursor\User\globalStorage\state.vscdb
   // macOS:   ~/Library/Application Support/Cursor/User/globalStorage/state.vscdb
@@ -28,23 +33,118 @@ function cursorGlobalDbPath() {
   return path.join(base, "User", "globalStorage", "state.vscdb");
 }
 
+function openCursorDb() {
+  const dbPath = cursorGlobalDbPath();
+  if (!fs.existsSync(dbPath)) return null;
+  let DatabaseSync;
+  try { ({ DatabaseSync } = require("node:sqlite")); } catch { return null; }
+  try {
+    return new DatabaseSync(dbPath, { readOnly: true });
+  } catch {
+    return null;
+  }
+}
+
+function parseComposerMeta(composerId, raw) {
+  let meta = null;
+  try { meta = JSON.parse(String(raw || "")); } catch { return null; }
+  return {
+    composerId,
+    name: meta ? String(meta.name || "").trim() : "",
+    createdAt: meta ? meta.createdAt : 0,
+    lastUpdatedAt: meta ? meta.lastUpdatedAt : 0,
+  };
+}
+
+function readConversationMetaFromDb(db, composerId) {
+  try {
+    const row = db.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(`composerData:${composerId}`);
+    return row ? parseComposerMeta(composerId, row.value) : null;
+  } catch {
+    return null;
+  }
+}
+
+function composerIdFromBubbleKey(key) {
+  const match = /^bubbleId:([^:]+):/.exec(String(key || ""));
+  return match ? match[1] : "";
+}
+
+// Lightweight metadata read used by the panel refresh path. Cached briefly so
+// syncing Cursor's official title does not reopen/scan SQLite on every repaint.
+function readConversationMeta(composerId) {
+  const id = String(composerId || "").trim();
+  if (!id) return null;
+  const cached = metaCache.get(id);
+  const now = Date.now();
+  if (cached && now - cached.at < META_CACHE_TTL_MS) return cached.value;
+
+  const db = openCursorDb();
+  if (!db) {
+    metaCache.set(id, { at: now, value: null });
+    return null;
+  }
+  try {
+    const value = readConversationMetaFromDb(db, id);
+    metaCache.set(id, { at: now, value });
+    return value;
+  } catch {
+    metaCache.set(id, { at: now, value: null });
+    return null;
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
+// MCP mode cannot read CURSOR_CONVERSATION_ID from an agent terminal. As a
+// fallback, find the Cursor conversation whose pasted bootstrap prompt contains
+// this local session id, then use its official title/history.
+function findConversationBySessionId(sessionId) {
+  const id = String(sessionId || "").trim();
+  if (!id) return null;
+  const cached = sessionLookupCache.get(id);
+  const now = Date.now();
+  if (cached && now - cached.at < SESSION_LOOKUP_CACHE_TTL_MS) return cached.value;
+
+  const db = openCursorDb();
+  if (!db) {
+    sessionLookupCache.set(id, { at: now, value: null });
+    return null;
+  }
+  try {
+    const rows = db.prepare(
+      "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%' AND value LIKE ? LIMIT 80",
+    ).all(`%${id}%`);
+    let best = null;
+    for (const row of rows || []) {
+      const composerId = composerIdFromBubbleKey(row.key);
+      if (!composerId) continue;
+      let bubble = null;
+      try { bubble = JSON.parse(String(row.value)); } catch { continue; }
+      const text = String((bubble && bubble.text) || "");
+      if (!text.includes(id) || !/当前会话\s*ID|session_id|wait_for_instruction|续聊助手/.test(text)) continue;
+      const meta = readConversationMetaFromDb(db, composerId) || { composerId, name: "", createdAt: 0, lastUpdatedAt: 0 };
+      const score = Number(meta.lastUpdatedAt || bubble.createdAt || meta.createdAt || 0);
+      if (!best || score >= best.score) best = { ...meta, score };
+    }
+    const value = best ? { composerId: best.composerId, name: best.name, createdAt: best.createdAt, lastUpdatedAt: best.lastUpdatedAt } : null;
+    sessionLookupCache.set(id, { at: now, value });
+    return value;
+  } catch {
+    sessionLookupCache.set(id, { at: now, value: null });
+    return null;
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
 // Read one conversation's full bubble history from Cursor's SQLite DB.
 // Returns { composerId, name, createdAt, messages: [{type, text, createdAt, ...}] }
 // or null when the DB / conversation can't be found.
 function readConversation(composerId) {
   if (!composerId) return null;
-  const dbPath = cursorGlobalDbPath();
-  if (!fs.existsSync(dbPath)) return null;
-
-  let DatabaseSync;
-  try { ({ DatabaseSync } = require("node:sqlite")); } catch { return null; }
-
-  let db;
-  try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
-  } catch {
-    return null;
-  }
+  const db = openCursorDb();
+  if (!db) return null;
 
   try {
     // Conversation metadata (title, timestamps).
@@ -134,6 +234,8 @@ function buildHandoffBrief(composerId, opts = {}) {
 
 module.exports = {
   cursorGlobalDbPath,
+  readConversationMeta,
+  findConversationBySessionId,
   readConversation,
   buildHandoffBrief,
 };
