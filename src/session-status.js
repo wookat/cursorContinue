@@ -21,7 +21,7 @@ const {
   sessionsLockDir,
 } = require("./sessions.js");
 const { readQueue, enqueueToSession, enqueueGlobal } = require("./queue.js");
-const { buildHandoffBrief, readConversationMeta, findConversationBySessionId } = require("./cursor-history.js");
+const { buildHandoffBrief } = require("./cursor-history.js");
 
 function sessionDisplaySeq(indexItem, index) {
   const fromId = /^agent-(\d+)/.exec(String((indexItem && indexItem.id) || ""));
@@ -84,17 +84,15 @@ function sessionSummary(paths, indexItem, settings = readSettings(paths), index 
   }
   const workingAgeMs = (activity === "working" || activity === "stalled") ? (heartbeatAgeMs || 0) : 0;
   const capturedConversationId = status.conversation_id || "";
-  const cursorConversation = capturedConversationId
-    ? readConversationMeta(capturedConversationId)
-    : findConversationBySessionId(sp.id);
-  const conversationId = capturedConversationId || (cursorConversation && cursorConversation.composerId) || "";
-  const officialTitle = cursorConversation && cursorConversation.name ? cursorConversation.name : "";
-  // Display name precedence: Cursor's official title wins when available so our
-  // panel follows the right-side Cursor conversation list. Otherwise a manual
-  // local rename wins; then the auto-title derived from the first instruction.
+  // Keep the status refresh path cheap and deterministic: panel cards use only
+  // local state. Cursor history/metadata reads are reserved for explicit detail
+  // or handoff actions so opening the panel never blocks on Cursor's SQLite DB.
+  const conversationId = capturedConversationId;
+  // Display name precedence is local-only: manual rename, then local auto-title,
+  // then the fixed session name/id.
   const displayName = (indexItem.nameManual && indexItem.name)
-    ? (officialTitle || indexItem.name)
-    : (officialTitle || indexItem.autoTitle || indexItem.name || sp.id);
+    ? indexItem.name
+    : (indexItem.autoTitle || indexItem.name || sp.id);
   return {
     id: sp.id,
     name: displayName,
@@ -129,8 +127,6 @@ function sessionSummary(paths, indexItem, settings = readSettings(paths), index 
     // surfaced so the panel can show/copy it with no manual entry.
     conversationId,
     conversationShort: conversationId ? String(conversationId).slice(0, 8) : "",
-    officialTitle,
-    titleSource: officialTitle ? "cursor" : (indexItem.nameManual ? "manual" : (indexItem.autoTitle ? "auto" : "default")),
     workspaceLabel: status.workspace_label || "",
     lastMessagePreview: compactForUi(status.last_message_preview || "", 160),
     lastResult: compactForUi(status.last_result || "", 240),

@@ -623,14 +623,13 @@
     if (!dialog) return;
     const session = detail?.session || {};
     const conv = detail?.conversation || null;
-    const title = conv?.name || session.officialTitle || session.name || detail?.sessionId || "";
+    const title = conv?.name || session.name || detail?.sessionId || "";
     setTextIfChanged($("sessionDetailTitle"), title ? `会话详情：${title}` : "会话详情");
     const meta = [
       detail?.sessionId ? `本地 ID：${detail.sessionId}` : "",
       detail?.conversationId ? `Cursor ID：${detail.conversationId}` : "",
       conv ? `官方消息：${conv.messageCount || conv.messages?.length || 0} 条` : "",
       session.transport ? `模式：${String(session.transport).toUpperCase()}` : "",
-      session.titleSource ? `标题来源：${session.titleSource}` : "",
     ].filter(Boolean).join(" · ");
     setTextIfChanged($("sessionDetailMeta"), meta || "未找到 Cursor 官方会话，显示本地桥接记录。");
 

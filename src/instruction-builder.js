@@ -22,7 +22,7 @@ const { effectiveSessionSettings } = require("./sessions.js");
 const { resolveInstructionSession } = require("./session-status.js");
 
 function titleInstruction(sessionId) {
-  return `请把 Cursor 右侧官方会话标题设置成一句短标题（建议 8-18 个中文字符），概括本会话真实任务；标题里不要包含"续聊助手"、session_id 或实现细节。本地面板会按 Cursor 官方标题同步显示。当前 session_id="${sessionId}"。`;
+  return `可以把 Cursor 右侧官方会话标题设置成一句短标题（建议 8-18 个中文字符），只用于你在 Cursor 内辨认本次任务；本地面板标题由面板编号/本地重命名控制，不读取 Cursor 标题。当前 session_id="${sessionId}"。`;
 }
 
 function buildAgentInstruction(context, sessionId) {

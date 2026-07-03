@@ -65,7 +65,7 @@ select:disabled {
 
 .shell {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: max-content max-content minmax(0, 1fr);
   gap: 6px;
   height: 100%;
   min-height: 0;
@@ -78,7 +78,7 @@ select:disabled {
 }
 
 .compact-shell {
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: max-content max-content minmax(0, 1fr);
 }
 
 .panel {
@@ -93,7 +93,7 @@ select:disabled {
 
 .topbar {
   display: flex;
-  align-items: stretch;
+  align-items: flex-start;
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 10px;
@@ -194,9 +194,10 @@ select:disabled {
 }
 
 .header-actions {
-  align-self: flex-end;
+  align-self: flex-start;
+  align-items: center;
   justify-content: flex-end;
-  margin-top: auto;
+  margin-top: 0;
   min-width: 0;
 }
 
@@ -1185,6 +1186,11 @@ select:disabled {
 
   .header-actions {
     justify-content: flex-start;
+  }
+
+  .topbar .brand {
+    flex: 0 1 auto;
+    width: 100%;
   }
 
   .settings-grid {
