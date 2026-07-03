@@ -23,12 +23,15 @@ const inst = require("./instruction.js");
 
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_INFO = { name: "local-continue-续聊助手", version: "1.2.0" };
-// Cursor hard-cuts an MCP tool call at ~60 min (-32001). Return a KEEPALIVE_NOOP a
-// bit before that so the agent re-invokes and the request never hard-fails.
-const DEFAULT_SOFT_TIMEOUT_MS = 3300 * 1000;
+// Cursor hard-cuts an MCP tool call at ~60 min (-32001). Return a KEEPALIVE_NOOP
+// well before that so the agent re-invokes and the request never hard-fails.
+// 3000s leaves a 10-minute margin (network jitter, client-side queuing) instead
+// of the old 5; overridable via --soft-timeout / env / mcpSoftTimeoutSeconds.
+const DEFAULT_SOFT_TIMEOUT_MS = 3000 * 1000;
 const BASE_POLL_MS = 200;
 const MAX_POLL_MS = 1000;
 const PROGRESS_NOTIFY_INTERVAL_MS = 25000;
+const GLOBAL_SIG_CACHE_MS = 1000;
 
 function defaultStateDir() {
   return path.join(process.cwd(), ".cursor", "local-continue-state");
@@ -45,10 +48,22 @@ function parseArgs(argv) {
 
 const CLI = parseArgs(process.argv.slice(2));
 const STATE_DIR = CLI["state-dir"] || process.env.LOCAL_CONTINUE_STATE_DIR || defaultStateDir();
-const SOFT_TIMEOUT_MS = (() => {
+// CLI / env override wins; otherwise the per-project settings.json key
+// mcpSoftTimeoutSeconds applies (re-read on every wait, so panel-driven changes
+// take effect without restarting the MCP server); else the built-in default.
+const SOFT_TIMEOUT_OVERRIDE_MS = (() => {
   const n = parseInt(CLI["soft-timeout"] || process.env.LOCAL_CONTINUE_MCP_SOFT_TIMEOUT || "", 10);
-  return Number.isFinite(n) && n > 0 ? n * 1000 : DEFAULT_SOFT_TIMEOUT_MS;
+  return Number.isFinite(n) && n > 0 ? n * 1000 : null;
 })();
+
+function softTimeoutMs() {
+  if (SOFT_TIMEOUT_OVERRIDE_MS !== null) return SOFT_TIMEOUT_OVERRIDE_MS;
+  try {
+    const seconds = Number(project.settings().mcpSoftTimeoutSeconds || 0);
+    if (Number.isFinite(seconds) && seconds > 0) return Math.max(60, seconds) * 1000;
+  } catch { /* fall through to default */ }
+  return DEFAULT_SOFT_TIMEOUT_MS;
+}
 
 function keepaliveText(sessionId) {
   return `KEEPALIVE_NOOP:
@@ -74,6 +89,38 @@ function sessionBusyText(sessionId, ownerPid) {
 请不要反复重试抢锁；在续聊助手面板为本对话新建一个会话并用它的 session_id，或改用一个唯一的 session_id，然后再调用 wait_for_instruction。`;
 }
 
+// A cancelled wait is ambiguous: client-side timeouts / UI switches cancel the
+// request (agent should re-enter the loop), but so does the user pressing stop
+// in some clients (agent should NOT fight the user to keep looping). We can't
+// distinguish the two from the notification alone, so track consecutive
+// cancels per session: the first ones instruct an unconditional re-invoke;
+// from the third in a short window the text tells the agent to treat a
+// deliberate user stop as final. (When the user stops the whole conversation
+// the agent never reads this text at all -- this only matters for repeated
+// automatic cancels, hence the generous threshold.)
+const CANCEL_STREAK_WINDOW_MS = 10 * 60 * 1000;
+const cancelStreaks = new Map(); // sessionId -> { count, lastMs }
+
+function noteCancelled(sessionId) {
+  const now = Date.now();
+  const entry = cancelStreaks.get(sessionId);
+  const count = entry && now - entry.lastMs <= CANCEL_STREAK_WINDOW_MS ? entry.count + 1 : 1;
+  cancelStreaks.set(sessionId, { count, lastMs: now });
+  return count;
+}
+
+function resetCancelled(sessionId) {
+  cancelStreaks.delete(sessionId);
+}
+
+function cancelledText(sessionId) {
+  const streak = noteCancelled(sessionId);
+  if (streak >= 3) {
+    return `本次等待再次被取消（10 分钟内第 ${streak} 次）。如果是你（用户）主动停止了本轮，请就此结束，不必重试；否则说明客户端在反复超时/切换，请再次调用 wait_for_instruction（session_id="${sessionId}"）继续等待，或在面板检查该会话。`;
+  }
+  return `本次等待被取消（通常是客户端超时或界面切换，不是错误）。请立即再次调用 wait_for_instruction（session_id="${sessionId}"）继续等待下一条指令，不要结束本轮。`;
+}
+
 // --- Working-presence heartbeat (MCP mode) -----------------------------------
 // The shell runtime spawns a detached beacon that watches the agent terminal's
 // PID so the panel can tell "working" from "interrupted" during the work gap
@@ -87,10 +134,32 @@ function sessionBusyText(sessionId, ownerPid) {
 // makes presence go stale -> "interrupted". (A single conversation interrupted
 // while its window stays open can't be detected over MCP; that's inherent.)
 const MCP_PRESENCE_INTERVAL_MS = 4000;
-const workingPresence = new Map(); // sessionId -> interval timer
+// Hard cap on how long a working-presence heartbeat may outlive its hand-off.
+// Unlike the shell beacon (which watches the agent terminal's PID and dies with
+// it), this window-level process has no per-conversation liveness signal: if the
+// agent never re-enters wait (turn ended without looping / crashed / user
+// interrupted), an uncapped interval would heartbeat forever and the panel
+// would show "working" until the whole window closed. After
+// max(workingTimeoutSeconds, this floor) we stop AND remove presence.json --
+// an absent file makes the panel fall back to its time-threshold heuristic
+// ("可能中断"), whereas a merely-stale file would read as a dead terminal
+// ("已中断"). A healthy marathon turn that outlives the cap degrades to that
+// soft warning and recovers the moment the agent re-enters wait.
+const MCP_PRESENCE_MIN_LIFETIME_MS = 60 * 60 * 1000;
+const workingPresence = new Map(); // sessionId -> { timer, session }
+
+function presenceLifetimeMs() {
+  let seconds = 0;
+  try {
+    seconds = Number(project.settings().workingTimeoutSeconds || 0);
+  } catch { /* fall through to the floor */ }
+  return Math.max(seconds > 0 ? seconds * 1000 : 0, MCP_PRESENCE_MIN_LIFETIME_MS);
+}
 
 function startWorkingPresence(session) {
   stopWorkingPresence(session.sessionId);
+  const startedMs = inst.nowMs();
+  const lifetimeMs = presenceLifetimeMs();
   const write = () => session.writeJsonBestEffort(session.presencePath, {
     beacon: true,
     mode: "mcp",
@@ -100,19 +169,144 @@ function startWorkingPresence(session) {
     interval_ms: MCP_PRESENCE_INTERVAL_MS,
   });
   write();
-  const timer = setInterval(write, MCP_PRESENCE_INTERVAL_MS);
+  const timer = setInterval(() => {
+    if (inst.nowMs() - startedMs >= lifetimeMs) {
+      stopWorkingPresence(session.sessionId, true);
+      return;
+    }
+    write();
+  }, MCP_PRESENCE_INTERVAL_MS);
   if (timer.unref) timer.unref();
-  workingPresence.set(session.sessionId, timer);
+  workingPresence.set(session.sessionId, { timer, session });
 }
 
-function stopWorkingPresence(sessionId) {
-  const timer = workingPresence.get(sessionId);
-  if (timer) {
-    clearInterval(timer);
-    workingPresence.delete(sessionId);
+function stopWorkingPresence(sessionId, removePresenceFile = false) {
+  const entry = workingPresence.get(sessionId);
+  if (!entry) return;
+  clearInterval(entry.timer);
+  workingPresence.delete(sessionId);
+  if (removePresenceFile) {
+    try { fs.rmSync(entry.session.presencePath, { force: true }); } catch { /* best effort */ }
   }
 }
 
+// One MCP server process can host many simultaneous session waiters. Each waiter
+// used to create its own watcher/stat loop for the single global idle-first queue,
+// which is harmless but noisy at 6+ sessions. This shared signal only reports that
+// global_queue.json may have changed; actual consumption still goes through
+// project.popGlobal(), which holds the cross-process global queue lock.
+function createGlobalQueueSignal(projectState) {
+  let dirty = true;
+  let signature = "init";
+  let signatureAt = 0;
+  let watcher = null;
+  let watcherAttemptAt = 0;
+  const subscribers = new Set();
+
+  const fire = () => {
+    dirty = true;
+    for (const listener of [...subscribers]) {
+      try { listener(); } catch { /* best effort */ }
+    }
+  };
+
+  const ensureWatcher = () => {
+    if (watcher) return;
+    const now = Date.now();
+    if (watcherAttemptAt && now - watcherAttemptAt < GLOBAL_SIG_CACHE_MS) return;
+    watcherAttemptAt = now;
+    try {
+      const targetFile = path.basename(projectState.globalQueuePath);
+      watcher = fs.watch(projectState.stateDir, { persistent: false }, (eventType, filename) => {
+        if (!filename || filename === targetFile) fire();
+      });
+      watcher.on("error", () => {
+        try { watcher.close(); } catch { /* already closed */ }
+        watcher = null;
+        dirty = true;
+        fire();
+      });
+    } catch {
+      watcher = null;
+    }
+  };
+
+  ensureWatcher();
+
+  return {
+    get active() { ensureWatcher(); return Boolean(watcher); },
+    signature() {
+      ensureWatcher();
+      const now = Date.now();
+      if (dirty || now - signatureAt >= GLOBAL_SIG_CACHE_MS) {
+        signature = inst.queueSignature(projectState.globalQueuePath);
+        signatureAt = now;
+        dirty = false;
+      }
+      return signature;
+    },
+    subscribe(listener) {
+      ensureWatcher();
+      subscribers.add(listener);
+      return () => subscribers.delete(listener);
+    },
+    close() {
+      subscribers.clear();
+      if (watcher) {
+        try { watcher.close(); } catch { /* already closed */ }
+        watcher = null;
+      }
+    },
+  };
+}
+
+function createMcpWaitNotifier(session, globalSignal) {
+  let pending = false;
+  let resolver = null;
+  let timer = null;
+
+  const fire = () => {
+    pending = true;
+    if (resolver) {
+      const resolve = resolver;
+      resolver = null;
+      if (timer) { clearTimeout(timer); timer = null; }
+      resolve();
+    }
+  };
+
+  const watchers = [];
+  try {
+    const targetFile = path.basename(session.queuePath);
+    const watcher = fs.watch(session.dir, { persistent: false }, (eventType, filename) => {
+      if (!filename || filename === targetFile) fire();
+    });
+    watcher.on("error", () => { /* polling safety-net covers gaps */ });
+    watchers.push(watcher);
+  } catch {
+    /* polling safety-net covers gaps */
+  }
+
+  const unsubscribeGlobal = globalSignal.subscribe(fire);
+
+  return {
+    active: watchers.length > 0 || globalSignal.active,
+    wait(maxMs) {
+      if (pending) { pending = false; return Promise.resolve(); }
+      return new Promise((resolve) => {
+        resolver = resolve;
+        timer = setTimeout(() => { resolver = null; timer = null; resolve(); }, Math.max(0, maxMs));
+      });
+    },
+    close() {
+      unsubscribeGlobal();
+      for (const watcher of watchers) { try { watcher.close(); } catch { /* ignore */ } }
+      watchers.length = 0;
+      if (timer) { clearTimeout(timer); timer = null; }
+      resolver = null;
+    },
+  };
+}
 // Block on this session's queue (and the global idle-first queue) until an item
 // arrives, a soft timeout elapses, or the MCP request is cancelled. Mirrors the
 // shell wait loop but returns text for the tool result instead of printing.
@@ -137,7 +331,8 @@ async function waitForInstructionMcp(project, sessionId, opts) {
   stopWorkingPresence(sessionId);
 
   const startedAtMs = inst.nowMs();
-  const keepaliveDeadline = SOFT_TIMEOUT_MS > 0 ? Date.now() + SOFT_TIMEOUT_MS : null;
+  const softTimeout = softTimeoutMs();
+  const keepaliveDeadline = softTimeout > 0 ? Date.now() + softTimeout : null;
   const offlineAfter = Number(project.settings().offlineAfterSeconds || 15);
   const heartbeatInterval = Math.max(1000, Math.min(5000, (offlineAfter / 3) * 1000));
   const agentEnv = inst.captureAgentEnv();
@@ -156,10 +351,7 @@ async function waitForInstructionMcp(project, sessionId, opts) {
   let lastProgress = 0;
   let lastSessionSig = "init";
   let lastGlobalSig = "init";
-  const notifier = inst.createQueueNotifier([
-    { dir: session.dir, file: path.basename(session.queuePath) },
-    { dir: project.stateDir, file: path.basename(project.globalQueuePath) },
-  ]);
+  const notifier = createMcpWaitNotifier(session, globalQueueSignal);
 
   try {
     if (opts.onProgress) {
@@ -169,14 +361,17 @@ async function waitForInstructionMcp(project, sessionId, opts) {
     for (;;) {
       if (opts.isCancelled && opts.isCancelled()) {
         session.writeStatus(runId, "cancelled", { transport: "mcp", uptime_ms: inst.nowMs() - startedAtMs });
-        return {
-          kind: "cancelled",
-          text: `本次等待被取消（通常是客户端超时或界面切换，不是错误）。请立即再次调用 wait_for_instruction（session_id="${sessionId}"）继续等待下一条指令，不要结束本轮。`,
-        };
+        return { kind: "cancelled", text: cancelledText(sessionId) };
       }
       const now = Date.now();
       if (now - lastHeartbeat >= heartbeatInterval) {
-        session.refreshWaiter(runId);
+        if (!session.refreshWaiter(runId)) {
+          // A rival waiter took the lock over while we were stalled. Stand down
+          // without touching status.json (the successor owns it now); the agent
+          // gets the same session_busy treatment as a busy-at-start.
+          const rival = session.currentWaiter();
+          return { kind: "session_busy", text: sessionBusyText(sessionId, rival && rival.pid) };
+        }
         session.writeStatus(runId, "waiting", { transport: "mcp", uptime_ms: inst.nowMs() - startedAtMs, keepalive_deadline_ms: keepaliveDeadline });
         lastHeartbeat = now;
       }
@@ -195,7 +390,7 @@ async function waitForInstructionMcp(project, sessionId, opts) {
         if (popped) item = popped;
       }
       if (!item) {
-        const globalSig = inst.queueSignature(project.globalQueuePath);
+        const globalSig = globalQueueSignal.signature();
         if (globalSig !== lastGlobalSig) {
           const [popped, , conclusive] = project.popGlobal();
           if (conclusive) lastGlobalSig = globalSig;
@@ -209,7 +404,10 @@ async function waitForInstructionMcp(project, sessionId, opts) {
         const rendered = inst.renderPayload(payload, wsRoot);
         // Pin the agent to this session's project directory (if configured).
         const scoped = inst.applySessionScope(project, sessionId, rendered);
-        session.writeStatus(runId, "received", {
+        // A "stop" ends the loop for good: record a distinct terminal state
+        // (panel shows "已停止" instead of inferring interrupted from a stale
+        // "received") and clean up any presence.json left from earlier rounds.
+        session.writeStatus(runId, rendered === "stop" ? "stopped" : "received", {
           transport: "mcp",
           last_ack_id: item.id,
           last_ack_at: inst.isoNow(),
@@ -219,12 +417,18 @@ async function waitForInstructionMcp(project, sessionId, opts) {
         session.appendHistory({ type: "received", id: item.id, source_queue: sourceQueue, transport: "mcp", session_id: sessionId, run_id: runId, message_preview: rendered.slice(0, 160), at: inst.isoNow() });
         // Hand-off: the agent is about to work, so drive the panel's "working"
         // state from a presence heartbeat until it re-enters wait (see above).
-        if (rendered !== "stop") startWorkingPresence(session);
+        if (rendered !== "stop") {
+          startWorkingPresence(session);
+        } else {
+          try { fs.rmSync(session.presencePath, { force: true }); } catch { /* best effort */ }
+        }
+        resetCancelled(sessionId);
         return { kind: rendered === "stop" ? "stop" : "instruction", text: scoped };
       }
 
       if (keepaliveDeadline !== null && Date.now() >= keepaliveDeadline) {
         session.writeStatus(runId, "keepalive", { transport: "mcp", last_message_preview: "KEEPALIVE_NOOP", uptime_ms: inst.nowMs() - startedAtMs });
+        resetCancelled(sessionId);
         return { kind: "keepalive", text: keepaliveText(sessionId) };
       }
 
@@ -336,6 +540,7 @@ const RESOURCES = [
 ];
 
 const project = new inst.ProjectState(STATE_DIR);
+const globalQueueSignal = createGlobalQueueSignal(project);
 const inflight = new Map(); // jsonrpc id -> { cancelled: boolean }
 
 function send(message) {
@@ -387,9 +592,16 @@ async function handleToolCall(id, params) {
   if (name === "report_result") {
     const summary = String(args.summary || "").trim();
     if (!summary) return respond(id, textResult("summary 不能为空。", true));
-    const session = project.session(args.session_id || "agent-1");
+    const sessionId = inst.safeSessionId(args.session_id || "agent-1");
+    const session = project.session(sessionId);
     session.recordResult(summary, args.status || "done", null);
-    inst.notifyWebhookResult(project, args.session_id || "agent-1", summary, args.status || "done", { transport: "mcp" });
+    inst.notifyWebhookResult(project, sessionId, summary, args.status || "done", { transport: "mcp" });
+    // A result report marks the end of the current work item. Stop the
+    // working-presence heartbeat and remove presence.json: an agent that
+    // reports here without ever re-entering wait would otherwise stay
+    // "working" forever, and a merely-stale file would read as a dead
+    // terminal instead of falling back to the time-threshold heuristic.
+    stopWorkingPresence(sessionId, true);
     return respond(id, textResult("已上报。"));
   }
   if (name === "get_status") {
@@ -409,7 +621,7 @@ async function handleToolCall(id, params) {
           progressToken,
           progress,
           message,
-          SOFT_TIMEOUT_MS > 0 ? Math.round(SOFT_TIMEOUT_MS / 1000) : undefined,
+          softTimeoutMs() > 0 ? Math.round(softTimeoutMs() / 1000) : undefined,
         ),
       });
       const kind = outcome.kind || "instruction";
@@ -456,9 +668,11 @@ function handleMessage(message) {
 
   // Requests --------------------------------------------------------------
   if (method === "initialize") {
-    const requested = params && params.protocolVersion;
+    // Per MCP spec: respond with the requested version only if we support it,
+    // otherwise with our own supported version -- never blindly echo an
+    // arbitrary client version we know nothing about.
     return respond(id, {
-      protocolVersion: requested || PROTOCOL_VERSION,
+      protocolVersion: PROTOCOL_VERSION,
       capabilities: {
         tools: { listChanged: false },
         resources: { listChanged: false, subscribe: false },

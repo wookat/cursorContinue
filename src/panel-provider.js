@@ -118,6 +118,14 @@ function capDetailText(value, limit = 30000) {
   return `${text.slice(0, limit)}\n…[内容过长，已截断 ${text.length - limit} 字符]`;
 }
 
+function cleanActivePaneTitle(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text || text.length > 120) return "";
+  if (/agent-[A-Za-z0-9_-]+/.test(text)) return "";
+  if (/wait_for_instruction|MCP bridge|shell bridge|Local Continue|Current session ID/i.test(text)) return "";
+  return text;
+}
+
 function localHistoryText(item) {
   if (!item || typeof item !== "object") return "";
   const payloadText = item.payload && item.payload.user_input ? item.payload.user_input : (item.message || "");
@@ -173,6 +181,7 @@ class PanelProvider {
     this.clients = new Set();
     this.timer = undefined;
     this.watcher = undefined;
+    this.flatWatchers = undefined; // dir -> fs.FSWatcher (non-recursive fallback)
     this.watchDebounce = undefined;
     this.notifiedResultMs = {};
     this.attentionBaselineSet = false;
@@ -186,15 +195,19 @@ class PanelProvider {
       this.channel = new LocalChannel(
         () => { try { return getPaths(this.context).sessionsDir; } catch { return ""; } },
         token,
-        (agentId) => this.onActiveSession(agentId),
+        (agentId, title) => this.onActiveSession(agentId, title),
       );
       this.channel.start();
     } catch { /* best effort */ }
   }
 
-  onActiveSession(agentId) {
+  onActiveSession(agentId, title) {
     if (this.clients.size === 0 || !agentId) return;
-    this.reply({ type: "selectSession", sessionId: agentId });
+    const paneTitle = cleanActivePaneTitle(title);
+    if (paneTitle) {
+      try { maybeSetAutoTitle(ensureRuntime(this.context), agentId, paneTitle); } catch { /* best effort */ }
+    }
+    this.reply({ type: "selectSession", sessionId: agentId, title: paneTitle });
   }
 
   attachWebview(webview, getVisible) {
@@ -278,20 +291,73 @@ class PanelProvider {
     this.timer = undefined;
   }
 
+  hasWatcher() {
+    return Boolean(this.watcher || (this.flatWatchers && this.flatWatchers.size));
+  }
+
   setupWatcher() {
-    if (this.watcher) return;
-    let stateDir;
+    if (this.hasWatcher()) return;
+    let paths;
     try {
-      stateDir = ensureRuntime(this.context).stateDir;
+      paths = ensureRuntime(this.context);
     } catch {
       return;
     }
     try {
-      this.watcher = fs.watch(stateDir, { recursive: true }, (eventType, filename) => this.onWatchEvent(filename));
+      this.watcher = fs.watch(paths.stateDir, { recursive: true }, (eventType, filename) => this.onWatchEvent(filename));
       this.watcher.on("error", () => this.disposeWatcher());
+      return;
     } catch {
       this.watcher = undefined;
     }
+    // Recursive fs.watch is unavailable here (Linux before Node 20, some network
+    // filesystems) -- e.g. a Remote-SSH extension host. Fall back to a set of
+    // non-recursive watches (state dir + sessions dir + each session dir) so the
+    // panel keeps its instant refresh instead of degrading to 1-3s polling.
+    this.setupFlatWatchers(paths);
+  }
+
+  setupFlatWatchers(paths) {
+    this.flatWatchers = new Map();
+    // Watching the sessions dir catches session-directory creation/removal, at
+    // which point the per-session watch set is rebuilt.
+    this.addFlatWatch(paths.stateDir, () => this.onWatchEvent(""));
+    this.addFlatWatch(paths.sessionsDir, () => { this.refreshFlatWatchers(paths); this.onWatchEvent(""); });
+    this.refreshFlatWatchers(paths);
+  }
+
+  addFlatWatch(dir, listener) {
+    if (!this.flatWatchers || this.flatWatchers.has(dir)) return;
+    try {
+      const watcher = fs.watch(dir, (eventType, filename) => listener(filename));
+      watcher.on("error", () => {
+        try { watcher.close(); } catch { /* already closed */ }
+        if (this.flatWatchers) this.flatWatchers.delete(dir);
+      });
+      this.flatWatchers.set(dir, watcher);
+    } catch {
+      // Directory vanished or watch unsupported; refresh/polling covers it.
+    }
+  }
+
+  refreshFlatWatchers(paths) {
+    if (!this.flatWatchers) return;
+    let current = [];
+    try {
+      current = fs.readdirSync(paths.sessionsDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(paths.sessionsDir, entry.name));
+    } catch {
+      return;
+    }
+    const wanted = new Set([paths.stateDir, paths.sessionsDir, ...current]);
+    for (const [dir, watcher] of [...this.flatWatchers]) {
+      if (!wanted.has(dir)) {
+        try { watcher.close(); } catch { /* already closed */ }
+        this.flatWatchers.delete(dir);
+      }
+    }
+    for (const dir of current) this.addFlatWatch(dir, (filename) => this.onWatchEvent(filename));
   }
 
   onWatchEvent(filename) {
@@ -308,6 +374,12 @@ class PanelProvider {
       try { this.watcher.close(); } catch { /* already closed */ }
       this.watcher = undefined;
     }
+    if (this.flatWatchers) {
+      for (const watcher of this.flatWatchers.values()) {
+        try { watcher.close(); } catch { /* already closed */ }
+      }
+      this.flatWatchers = undefined;
+    }
     if (this.watchDebounce) {
       clearTimeout(this.watchDebounce);
       this.watchDebounce = undefined;
@@ -320,7 +392,7 @@ class PanelProvider {
     const sessions = status.sessions || [];
     const hasOnline = sessions.some((session) => session.connected);
     const hasLive = sessions.some((session) => session.activity === "working" || session.activity === "stalled");
-    const delay = this.watcher
+    const delay = this.hasWatcher()
       ? (hasLive ? 3000 : 5000)
       : (hasOnline || hasLive || status.totalQueueLength > 0 ? 1000 : 3000);
     this.timer = setTimeout(() => this.postStatus({ forcePatch: false }), delay);

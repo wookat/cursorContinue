@@ -79,7 +79,7 @@ shared.js → fs-utils.js → paths.js → settings.js
 
 从 `dist/` 目录安装最新发布包，或自行打包（见下文）：
 
-1. 在 Cursor 安装 `dist/local-continue-assistant-1.4.1.vsix`（或更新的版本号）。
+1. 在 Cursor 安装 `dist/local-continue-assistant-1.4.2.vsix`（或更新的版本号）。
 2. 打开任意项目目录。
 3. 打开 `续聊助手` 面板。
 4. 点击 `新建会话`，或直接使用默认的 `会话 1`。
@@ -156,6 +156,16 @@ npm run package
 打包后的 `.vsix` 会生成在项目根目录，可移入 `dist/` 目录保存。`reference/` 目录存放参考插件包供分析用，两者均不提交 git。
 
 ## 更新日志
+
+### 1.4.2
+
+多会话性能与官方上下文转接增强：
+
+- **MCP 全局队列共享 watcher/cache**：`runtime/mcp-server.js` 将 `global_queue.json` 的签名检查与 watcher 合并为进程级共享信号，多个 session 复用一次 stat/read 唤醒；实际消息领取仍走原有锁和 `popGlobal()`，避免抢消息或丢消息。
+- **官方聊天框活动会话同步优化**：`official-retry-helper.js` 沿用 pane 级 `WeakMap` 缓存，第一次识别 `agentId` 时同步尝试读取该 pane 标题，并通过 `/lca/active` 把 `{ agentId, title }` 一起发回插件；插件侧只在安全情况下写入 autoTitle，不覆盖手动命名。
+- **会话标题种子调整**：复制启动指令时优先使用 `会话 N` 作为官方聊天标题种子，避免新对话被 Cursor 自动命名成 “MCP bridge conversation”。
+- **Cursor 官方 conversation ID 转接强化**：会话卡片与转接下拉更明确显示 Cursor 官方 `conversation/composer ID`；转接上下文、完整历史 brief 和目标会话指令都会把官方 ID 放在前置位置，方便新会话按 ID 定位原官方上下文。
+- **轮询与状态路径小优化**：轮询调度只读取候选会话队列长度，减少持锁期间的状态/信标读取；面板与状态路径保持短缓存和低频 DB 读取策略。
 
 ### 1.4.1
 

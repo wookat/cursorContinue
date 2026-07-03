@@ -63,6 +63,10 @@ const DEFAULT_SETTINGS = {
   imageLimit: 50,
   notifyOnAttention: true,
   retryMaxRetries: 200,
+  // MCP wait_for_instruction returns KEEPALIVE_NOOP after this many seconds so
+  // Cursor's ~60min hard cut (-32001) never fires mid-wait. 3000s keeps a
+  // 10-minute safety margin; runtime override: --soft-timeout / env.
+  mcpSoftTimeoutSeconds: 3000,
   // Opt-in outbound webhook: when a session finishes a turn and re-enters the
   // wait loop (reports a result), POST a small JSON to this URL. Empty = off.
   webhookUrl: "",

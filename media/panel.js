@@ -352,7 +352,7 @@
     // CURSOR_CONVERSATION_ID; show a short, copy-on-click chip so the user can
     // grab the exact Cursor chat id without ever typing it.
     const cidChip = session.conversationShort
-      ? `<span class="session-cid" role="button" tabindex="0" data-copy-cid="${escapeHtml(session.conversationId)}" title="Cursor 会话 ID：${escapeHtml(session.conversationId)}（点击复制）">🔗 ${escapeHtml(session.conversationShort)}</span>`
+      ? `<span class="session-cid" role="button" tabindex="0" data-copy-cid="${escapeHtml(session.conversationId)}" title="Cursor 官方 conversation ID：${escapeHtml(session.conversationId)}（点击复制；转接时用于读取原官方上下文）">CID ${escapeHtml(session.conversationShort)}</span>`
       : "";
     // A folder chip when the session is pinned to a project dir, so the user can
     // see at a glance that this session only works inside that one project.
@@ -728,7 +728,7 @@
   }
 
   function handoffOptionLabel(session) {
-    const cid = session.conversationShort ? ` 🔗${session.conversationShort}` : "";
+    const cid = session.conversationShort ? ` · Cursor ${session.conversationShort}` : "";
     return `${session.name || session.id} · ${session.connected ? "在线" : "离线"}${cid}`;
   }
 
@@ -739,6 +739,7 @@
   function handoffContextFor(session) {
     if (!session) return "";
     const parts = [];
+    if (session.conversationId) parts.push(`[原 Cursor 官方会话 ID] ${session.conversationId}`);
     if (session.lastMessagePreview) parts.push(`[原会话最近指令] ${session.lastMessagePreview}`);
     if (session.lastResult) parts.push(`[原会话最近结果] ${session.lastResult}`);
     return parts.join("\n");
@@ -1108,7 +1109,9 @@
       // lightweight preview in the handoff textarea with the real context.
       const ta = $("handoffContext");
       if (ta && document.getElementById("handoffDialog") && !document.getElementById("handoffDialog").classList.contains("hidden")) {
-        ta.value = data.brief;
+        const source = (state.sessions || []).find((s) => s.id === $("handoffSource").value);
+        const cid = source && source.conversationId ? `[原 Cursor 官方会话 ID] ${source.conversationId}\n\n` : "";
+        ta.value = `${cid}${data.brief}`;
         ta.placeholder = "要让目标会话继续完成的内容…";
       }
     }

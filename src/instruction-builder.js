@@ -21,8 +21,16 @@ const { readSettings } = require("./settings.js");
 const { effectiveSessionSettings } = require("./sessions.js");
 const { resolveInstructionSession } = require("./session-status.js");
 
+function sessionTitleSeed(sessionId) {
+  const id = String(sessionId || "agent");
+  const seq = /^agent-(\d+)/.exec(id);
+  if (seq) return `会话 ${seq[1]}`;
+  return `会话 ${id.replace(/^agent-/, "").slice(0, 8) || "默认"}`;
+}
+
 function titleInstruction(sessionId) {
-  return `可以把 Cursor 右侧官方会话标题设置成一句短标题（建议 8-18 个中文字符），只用于你在 Cursor 内辨认本次任务；本地面板标题由面板编号/本地重命名控制，不读取 Cursor 标题。当前 session_id="${sessionId}"。`;
+  const seed = sessionTitleSeed(sessionId);
+  return `请优先把 Cursor 右侧官方会话标题设置为「${seed}」；收到第一条真实任务后，可以改成一句更具体的短任务标题（建议 8-18 个中文字符）。这个标题只用于你在 Cursor 内辨认本次任务；本地面板标题由面板编号/本地重命名控制，不读取 Cursor 标题。当前 session_id="${sessionId}"。`;
 }
 
 function buildAgentInstruction(context, sessionId) {
@@ -31,9 +39,12 @@ function buildAgentInstruction(context, sessionId) {
   const resolved = resolveInstructionSession(paths, settings, sessionId);
   const id = resolved.id;
   const waitCmd = runtimeWaitCommand(paths, effectiveSessionSettings(paths, settings, id), id);
-  const text = `请从现在开始使用"续聊助手"的 shell bridge 循环工作。
+  const titleSeed = sessionTitleSeed(id);
+  const text = `${titleSeed}
 
 当前会话 ID：${id}
+
+请从现在开始使用"续聊助手"的 shell 等待循环工作。
 
 具体要求：
 1. 正常完成当前这轮任务，并设置本会话标题：${titleInstruction(id)}
@@ -94,9 +105,12 @@ function buildMcpInstruction(context, sessionId) {
   const settings = readSettings(paths);
   const resolved = resolveInstructionSession(paths, settings, sessionId);
   const id = resolved.id;
-  const text = `请从现在开始使用"续聊助手"的 MCP bridge 循环工作。
+  const titleSeed = sessionTitleSeed(id);
+  const text = `${titleSeed}
 
 当前会话 ID：${id}
+
+请从现在开始使用"续聊助手"的 MCP 工具循环工作。
 
 具体要求：
 1. 正常完成当前这轮任务，并设置本会话标题：${titleInstruction(id)}

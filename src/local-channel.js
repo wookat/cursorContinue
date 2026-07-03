@@ -28,6 +28,10 @@ const CHANNEL_PORT_BASE = 48090;
 const CHANNEL_PORT_SPAN = 30;
 const CHANNEL_TOKEN_KEY = "localContinue.channelToken";
 
+function cleanActiveTitle(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
 // A stable per-install token so the injected helper can prove it speaks our
 // protocol. Persisted in globalState so it survives restarts and matches the
 // value baked into the workbench patch at install time.
@@ -116,7 +120,8 @@ class LocalChannel {
         if (!this.token || data.token !== this.token) { this._send(res, 403, { error: "forbidden" }); return; }
         const agentId = String(data.agentId || "");
         if (!this._owns(agentId)) { this._send(res, 200, { ok: true, matched: false }); return; }
-        try { this.onActive(agentId); } catch { /* best effort */ }
+        const title = cleanActiveTitle(data.title);
+        try { this.onActive(agentId, title); } catch { /* best effort */ }
         this._send(res, 200, { ok: true, matched: true });
       });
       return;

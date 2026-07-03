@@ -207,6 +207,7 @@ function buildHandoffBrief(composerId, opts = {}) {
 
   const lines = [];
   lines.push(`== 原会话完整历史（${conv.messageCount} 条消息，${conv.name || "未命名"}）==`);
+  lines.push(`Cursor 官方 conversation ID：${composerId}`);
 
   // Take the most recent N messages to stay within bounds.
   const recent = conv.messages.slice(-maxMessages);

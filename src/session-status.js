@@ -26,7 +26,7 @@ const { buildHandoffBrief } = require("./cursor-history.js");
 function sessionDisplaySeq(indexItem, index) {
   const fromId = /^agent-(\d+)/.exec(String((indexItem && indexItem.id) || ""));
   if (fromId) return Number(fromId[1]);
-  const fromName = /(?:会话|浼氳瘽)?\s*(\d+)/.exec(String((indexItem && indexItem.name) || ""));
+  const fromName = /(?:会话)?\s*(\d+)/.exec(String((indexItem && indexItem.name) || ""));
   if (fromName) return Number(fromName[1]);
   return index + 1;
 }
@@ -176,11 +176,16 @@ function chooseRoundRobinSession(paths) {
     if (!sessions.length) throw new Error("没有可用会话。");
     for (let offset = 0; offset < sessions.length; offset += 1) {
       const pos = (index.roundRobinIndex + offset) % sessions.length;
-      const candidate = sessionSummary(paths, sessions[pos]);
-      if (candidate.queueLength < settings.perSessionQueueLimit) {
+      const candidate = sessions[pos];
+      // Only the queue length gates eligibility, so read just the queue file
+      // instead of building a full sessionSummary (status + presence reads)
+      // per candidate -- this runs while holding the sessions lock, and lock
+      // hold time scales with the session count.
+      const queueLength = readQueue(sessionPaths(paths, candidate.id).queue).length;
+      if (queueLength < settings.perSessionQueueLimit) {
         index.roundRobinIndex = (pos + 1) % sessions.length;
         writeSessionsIndex(paths, index);
-        return candidate.id;
+        return safeSessionId(candidate.id);
       }
     }
     throw new Error("所有会话队列都已达到上限。");
@@ -232,7 +237,7 @@ function handoffSession(paths, sourceId, targetId, context, reason) {
 
   const userInput = [
     `会话转接：请接管原会话「${sourceName}」未完成的任务。`,
-    sourceCid ? `原 Cursor 会话 ID：${sourceCid}` : "",
+    sourceCid ? `原 Cursor 官方 conversation ID：${sourceCid}` : "原 Cursor 官方 conversation ID：未捕获，请优先使用下方转接上下文。",
     `转接原因：${why}`,
     "",
     historyBrief ? historyBrief : "",

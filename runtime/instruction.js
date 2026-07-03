@@ -405,6 +405,17 @@ class SessionState {
   _waiterCache = null;
   currentWaiter() {
     if (this._waiterCache) return this._waiterCache;
+    return this.readWaiterOwner();
+  }
+
+  // Fresh disk read of the waiter lock's owner.json, bypassing (and refreshing)
+  // the cache. Ownership decisions MUST use this: after a stale takeover (this
+  // process stalled past LOCK_STALE_MS and a rival waiter rmSync'd + re-created
+  // the lock), the cached copy still claims the lock is ours -- trusting it
+  // would let two waiters alternately overwrite owner.json and each consume
+  // items from the same session queue. The cache stays for display-only reads
+  // (writeStatus embeds the waiter every heartbeat).
+  readWaiterOwner() {
     const owner = this.readJson(path.join(this.waiterLockDir, "owner.json"), null);
     this._waiterCache = owner;
     return owner;
@@ -430,7 +441,9 @@ class SessionState {
         fs.mkdirSync(this.waiterLockDir, { recursive: false });
       } catch (error) {
         if (error && error.code !== "EEXIST") throw error;
-        const owner = this.currentWaiter() || {};
+        // Fresh read: a cached owner from a previous loop iteration (or a prior
+        // wait in this process) would make the staleness math judge old data.
+        const owner = this.readWaiterOwner() || {};
         const heartbeatMs = Number(owner.heartbeat_ms || 0);
         const ageMs = heartbeatMs ? nowMs() - heartbeatMs : LOCK_STALE_MS + 1;
         if (ageMs > LOCK_STALE_MS) {
@@ -451,14 +464,22 @@ class SessionState {
     }
   }
 
+  // Heartbeat the waiter lock. Returns true while this run still owns it;
+  // false when a rival took it over after judging us stale (or the lock is
+  // gone mid-takeover) -- the caller must then exit its wait loop instead of
+  // continuing to consume the queue alongside the successor.
   refreshWaiter(runId) {
-    const owner = this.currentWaiter() || {};
-    if (owner.run_id === runId) this.writeWaiterOwner(runId);
+    const owner = this.readWaiterOwner();
+    if (!owner || owner.run_id !== runId) return false;
+    this.writeWaiterOwner(runId);
+    return true;
   }
 
   releaseWaiter(runId) {
-    const owner = this.currentWaiter() || {};
-    if (owner.run_id === runId) fs.rmSync(this.waiterLockDir, { recursive: true, force: true });
+    // Fresh read for the same reason as refreshWaiter: after a takeover we
+    // must not delete the successor's lock on our way out.
+    const owner = this.readWaiterOwner();
+    if (owner && owner.run_id === runId) fs.rmSync(this.waiterLockDir, { recursive: true, force: true });
     this._waiterCache = null;
   }
 
@@ -742,6 +763,17 @@ function sessionBusyMessage(sessionId, ownerPid) {
 请不要重复运行 wait、也不要去结束其它进程；请在续聊助手面板为本对话新建一个会话并复制其启动指令重开本循环，或让本对话改用一个唯一的 --session-id。`;
 }
 
+// Printed when a parked waiter discovers mid-wait that its lock was taken over
+// (we stalled past the staleness threshold and a rival waiter claimed the
+// session). Keeps the SESSION_BUSY: prefix so agent rules already handling
+// "busy at start" apply the same do-not-blind-retry behavior here.
+function waiterLostMessage(sessionId, ownerPid) {
+  const pid = ownerPid ? `pid ${ownerPid}` : "另一个进程";
+  return `SESSION_BUSY:
+会话 ${sessionId} 的等待锁在等待期间被另一个进程接管（${pid}；本进程曾停顿超过陈旧阈值，another instruction waiter is already active for this session）。
+为避免两个对话消费同一个队列，本次等待已退出。请按 SESSION_BUSY 处理：不要反复重试抢锁；改用一个唯一的 --session-id 重开循环，或确认另一个对话已停止后再重试一次。`;
+}
+
 // queueSignature / createQueueNotifier / isProcessAlive and the BEACON_* cadence
 // constants are imported from shared.js at the top of this file.
 
@@ -802,6 +834,16 @@ async function runBeacon(project, sessionId, watchPpid, intervalMs) {
     // is the cue to exit, so presence.json goes stale within ~one interval.
     if (ppid > 0 && !isProcessAlive(ppid)) break;
     if (nowMs() - startedMs > BEACON_MAX_LIFETIME_MS) break;
+    // Session got a "stop": the loop is over for good, so remove our presence
+    // file and exit rather than heartbeating for as long as the (still open)
+    // terminal lives. Removal (vs letting the file go stale) matters: a stale
+    // file plus the last "received"-family status would read as a dead
+    // terminal ("已中断") instead of a deliberate stop.
+    const state = session.readJson(session.statusPath, {}).state;
+    if (state === "stopped") {
+      try { fs.rmSync(session.presencePath, { force: true }); } catch { /* best effort */ }
+      break;
+    }
     session.writeJsonBestEffort(session.presencePath, {
       beacon: true,
       pid: process.pid,
@@ -915,7 +957,14 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
         lastSpinnerBeat = now;
       }
       if (now - lastHeartbeat >= heartbeatInterval) {
-        session.refreshWaiter(runId);
+        if (!session.refreshWaiter(runId)) {
+          // A rival waiter took the lock over while we were stalled. Stand down
+          // without touching status.json (the successor owns it now).
+          const rival = session.currentWaiter();
+          clearSpinner();
+          console.log(waiterLostMessage(sessionId, rival && rival.pid));
+          return 3;
+        }
         session.writeStatus(runId, "waiting", { transport: "shell", uptime_ms: nowMs() - startedAtMs, keepalive_deadline_ms: keepaliveDeadline });
         lastHeartbeat = now;
       }
@@ -970,7 +1019,11 @@ async function waitForInstruction(project, sessionId, timeoutSeconds, keepaliveS
         };
         session.appendHistory({ type: "received", ...ack });
         project.appendHistory({ type: "received", ...ack });
-        session.writeStatus(runId, "received", {
+        // A "stop" ends the session loop for good: record a distinct terminal
+        // state so the panel shows "已停止" instead of inferring working/
+        // interrupted from a stale "received" + the beacon still heartbeating
+        // for as long as the (still open) terminal lives.
+        session.writeStatus(runId, rendered === "stop" ? "stopped" : "received", {
           transport: "shell",
           last_ack_id: ack.id,
           last_ack_at: ack.received_at,
@@ -1158,9 +1211,9 @@ async function main() {
     return waitForInstruction(
       project,
       args["session-id"] || "agent-1",
-      toInt(args.timeout, 0),
-      toInt(args.keepalive, 90),
-      toFloat(args.poll, 0.2),
+      toInt(args.timeout, DEFAULT_SETTINGS.waitTimeoutSeconds),
+      toInt(args.keepalive, DEFAULT_SETTINGS.keepaliveSeconds),
+      toFloat(args.poll, DEFAULT_SETTINGS.pollSeconds),
       args.report || null,
       args["report-status"] || "done",
     );

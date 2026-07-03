@@ -76,7 +76,9 @@
   const SESSION_SCAN_MS = 800;
   let chPort = 0;              // cached owner port for the active session
   let lastPushedSession = ""; // last agent id we synced to the panel
+  let lastPushedTitle = "";
   let lastSessionScan = 0;
+  const paneSessionCache = new WeakMap(); // conversation pane/scope -> { agentId, title } once discovered
 
   function retryGapMs(count) {
     if (count <= 5) return 500;
@@ -607,8 +609,9 @@
 
   // ② Tell the panel which session the active conversation belongs to, so it
   // auto-selects it. Only fires when the active session actually changes.
-  async function pushActiveSession(agentId) {
-    if (!agentId || agentId === lastPushedSession) return;
+  async function pushActiveSession(agentId, title) {
+    const cleanTitle = cleanPaneTitle(title);
+    if (!agentId || (agentId === lastPushedSession && cleanTitle === lastPushedTitle)) return;
     let port = 0;
     try { port = await findOwnerPort(agentId); } catch (e) { port = 0; }
     if (!port) return; // channel unavailable — ① (icon number) still works
@@ -616,11 +619,11 @@
       const res = await chFetch(port, "/lca/active", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agentId, token: CH_TOKEN }),
+        body: JSON.stringify({ agentId, title: cleanTitle, token: CH_TOKEN }),
       });
       if (res && res.ok) {
         const data = await res.json().catch(() => null);
-        if (data && data.matched) { lastPushedSession = agentId; log("synced active session", agentId); }
+        if (data && data.matched) { lastPushedSession = agentId; lastPushedTitle = cleanTitle; log("synced active session", agentId, cleanTitle); }
       }
     } catch (e) { /* best effort */ }
   }
@@ -629,18 +632,69 @@
     return area.closest(".pane-body") || area.closest(".pane") || area.closest(".split-view-view") || document.body;
   }
 
+  function cleanPaneTitle(value) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text || text.length > 120) return "";
+    if (/agent-[A-Za-z0-9_-]+/.test(text)) return "";
+    if (/wait_for_instruction|MCP bridge|shell bridge|Local Continue|Current session ID/i.test(text)) return "";
+    if (/^\d+$/.test(text)) return "";
+    return text;
+  }
+
+  function readPaneTitle(scope) {
+    if (!scope || scope === document.body) return "";
+    const roots = [];
+    const pane = scope.closest(".pane") || scope.closest(".split-view-view") || scope;
+    if (pane) roots.push(pane);
+    if (scope !== pane) roots.push(scope);
+    const selectors = [
+      '[data-testid*="title" i]',
+      '[class*="title" i]',
+      '[aria-label]',
+      '[title]',
+      '[role="tab"]',
+    ];
+    for (const root of roots) {
+      for (const selector of selectors) {
+        let nodes = [];
+        try { nodes = root.querySelectorAll(selector); } catch (e) { nodes = []; }
+        for (const node of nodes) {
+          const rect = typeof node.getBoundingClientRect === "function" ? node.getBoundingClientRect() : null;
+          if (rect && (rect.width === 0 || rect.height === 0)) continue;
+          const candidates = [
+            node.getAttribute && node.getAttribute("aria-label"),
+            node.getAttribute && node.getAttribute("title"),
+            node.textContent,
+          ];
+          for (const candidate of candidates) {
+            const title = cleanPaneTitle(candidate);
+            if (title) return title;
+          }
+        }
+      }
+    }
+    return "";
+  }
+
   // Pull the pasted "当前会话 ID：agent-X" out of a conversation. Scans human
   // message bubbles (textContent, no reflow) and fast-skips non-matching ones.
-  function detectSessionIdIn(scope) {
-    if (!scope) return "";
+  function detectSessionMetaIn(scope) {
+    if (!scope) return null;
+    const cacheable = scope !== document.body;
+    const cached = cacheable ? paneSessionCache.get(scope) : null;
+    if (cached && cached.agentId) return cached;
     const nodes = scope.querySelectorAll('.composer-human-message, [data-message-index], [data-message-role="human"]');
     for (const node of nodes) {
       const text = node.textContent || "";
       if (text.indexOf("当前会话") === -1) continue;
       const match = text.match(SESSION_RE);
-      if (match) return match[1];
+      if (match) {
+        const meta = { agentId: match[1], title: readPaneTitle(scope) };
+        if (cacheable) paneSessionCache.set(scope, meta);
+        return meta;
+      }
     }
-    return "";
+    return null;
   }
 
   // agent-4-mr0fw2oa -> "4"; falls back to the first few id chars.
@@ -663,7 +717,7 @@
       e.preventDefault();
       e.stopPropagation();
       const id = chip.dataset.agentId || "";
-      if (id) { lastPushedSession = ""; pushActiveSession(id); }
+      if (id) { lastPushedSession = ""; pushActiveSession(id, chip.dataset.title || ""); }
     };
     const retry = area.querySelector(".lca-retry-btn");
     if (retry) area.insertBefore(chip, retry); else area.appendChild(chip);
@@ -674,17 +728,28 @@
   // the id of the active (visible) conversation for ② auto-select. Only continue
   // conversations (those with the pasted session id) get a chip; others don't.
   function updateSessionChips() {
-    let active = "";
+    let active = null;
     document.querySelectorAll(".button-container.composer-button-area").forEach((area) => {
-      const id = detectSessionIdIn(sessionScopeFor(area));
+      const visible = area.offsetParent !== null;
+      const scope = sessionScopeFor(area);
+      const meta = (scope !== document.body ? paneSessionCache.get(scope) : null) || (visible ? detectSessionMetaIn(scope) : null);
+      const id = meta && meta.agentId ? meta.agentId : "";
+      if (meta && !meta.title && visible && scope !== document.body) {
+        const title = readPaneTitle(scope);
+        if (title) {
+          meta.title = title;
+          paneSessionCache.set(scope, meta);
+        }
+      }
       let chip = area.querySelector(".lca-sess");
       if (id) {
         if (!chip) chip = ensureSessionChip(area);
         chip.dataset.agentId = id;
+        chip.dataset.title = (meta && meta.title) || "";
         const label = sessionShortLabel(id);
         if (chip.textContent !== label) chip.textContent = label;
         chip.title = `续聊助手会话：${id}（点击在面板选中）`;
-        if (area.offsetParent !== null) active = id;
+        if (visible) active = meta;
       } else if (chip) {
         chip.remove();
       }
@@ -696,9 +761,9 @@
     const now = Date.now();
     if (now - lastSessionScan < SESSION_SCAN_MS) return;
     lastSessionScan = now;
-    let active = "";
+    let active = null;
     try { active = updateSessionChips(); } catch (e) { /* DOM shape changed */ }
-    if (active) pushActiveSession(active);
+    if (active && active.agentId) pushActiveSession(active.agentId, active.title || "");
   }
 
   function bootstrap() {
