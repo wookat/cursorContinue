@@ -157,6 +157,15 @@ npm run package
 
 ## 更新日志
 
+### 1.4.1
+
+性能优化：面板状态刷新不再依赖 Cursor 内部 SQLite 数据库，纯本地状态驱动：
+
+- **移除 Cursor DB 依赖**：`session-status.js` 的 `sessionSummary` 在状态刷新路径中不再调用 `readConversationMeta`/`findConversationBySessionId`（两者均需读取 Cursor 的 SQLite 数据库），面板卡片标题只使用本地状态（manual rename / autoTitle / 默认名），打开面板时不再因 DB 读取而阻塞。同步移除 `officialTitle` / `titleSource` 字段，简化摘要数据契约。
+- **会话详情 UI 同步清理**：`panel.js` 会话详情弹窗不再显示已移除的 `officialTitle` / `titleSource`，元数据行更简洁。
+- **指令提示文字更新**：`instruction-builder.js` 的 `titleInstruction` 不再声称「本地面板会按 Cursor 官方标题同步显示」，改为「本地面板标题由面板编号/本地重命名控制，不读取 Cursor 标题」。
+- **topbar 响应式改进**：`panel.css` 窄屏时 `.brand` 换行 (`flex: 0 1 auto; width: 100%`)，`.topbar` 对齐方式优化，避免元素溢出。
+
 ### 1.3.1
 
 安全与健壮性加固（不改 UI、不改协议，向后兼容）：
