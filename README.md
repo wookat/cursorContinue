@@ -79,7 +79,7 @@ shared.js → fs-utils.js → paths.js → settings.js
 
 从 `dist/` 目录安装最新发布包，或自行打包（见下文）：
 
-1. 在 Cursor 安装 `dist/local-continue-assistant-0.7.6.vsix`。
+1. 在 Cursor 安装 `dist/local-continue-assistant-1.4.1.vsix`（或更新的版本号）。
 2. 打开任意项目目录。
 3. 打开 `续聊助手` 面板。
 4. 点击 `新建会话`，或直接使用默认的 `会话 1`。
