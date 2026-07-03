@@ -133,6 +133,7 @@ function panelHtml(context, webview) {
             <div class="advanced-title">图标注入 / 本机聊天框重试</div>
             <div id="retryNote" class="advanced-note">只作用于本机 Cursor 官方聊天框，不作用于 SSH 服务器。</div>
             <button class="mini-button primary" id="installPatch">注入图标 / 修复</button>
+            <button class="mini-button" id="toggleRetryHelper">暂停自动重试</button>
             <button class="mini-button" id="uninstallPatch">卸载注入</button>
           </section>
           <section class="advanced-section">

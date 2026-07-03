@@ -226,7 +226,19 @@
       : patch.installed
         ? "已写入：付费墙/402/限流 自动重试并自动隐藏错误（native 断路器 5000次/波 + DOM 自动隐藏 + 定期GC回收防OOM）。若没看到图标，请完全退出并重启 Cursor（不是重载窗口）。"
         : "点「注入图标 / 修复」写入本机 Cursor 官方聊天框；装好后需完全重启 Cursor。不作用于 SSH 服务器。";
-    setTextIfChanged($("retryNote"), retryNoteText);
+    const retryConflictText = patch.conflicts && patch.conflicts.length
+      ? ` 检测到外部补丁：${patch.conflicts.map((item) => item.name || item.id).join(", ")}，可能同时操作官方聊天框。`
+      : "";
+    const retryControlText = status.retryControl && status.retryControl.enabled === false
+      ? " 当前已从面板暂停自动重试。"
+      : "";
+    setTextIfChanged($("retryNote"), retryNoteText + retryConflictText + retryControlText);
+    const toggleRetryHelper = $("toggleRetryHelper");
+    if (toggleRetryHelper) {
+      const retryEnabled = !(status.retryControl && status.retryControl.enabled === false);
+      toggleRetryHelper.dataset.enabled = retryEnabled ? "1" : "0";
+      setTextIfChanged(toggleRetryHelper, retryEnabled ? "暂停自动重试" : "启用自动重试");
+    }
 
     const selected = selectedSession();
     setSelectedSessionLabel();
@@ -938,6 +950,10 @@
     $("showTimelineBtn").addEventListener("click", () => { renderTimeline([]); send("requestResultTimeline"); openModal("timelineDialog"); });
     $("showQueueBtn").addEventListener("click", () => { openModal("queueDialog"); renderQueue(); });
     $("installPatch").addEventListener("click", () => send("installRetryPatch"));
+    const toggleRetryHelper = $("toggleRetryHelper");
+    if (toggleRetryHelper) toggleRetryHelper.addEventListener("click", () => {
+      send("setRetryHelperEnabled", { enabled: toggleRetryHelper.dataset.enabled !== "1" });
+    });
     $("uninstallPatch").addEventListener("click", () => send("uninstallRetryPatch"));
     $("saveSettings").addEventListener("click", saveSettings);
     const testWebhookBtn = $("testWebhookBtn");

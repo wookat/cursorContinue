@@ -34,13 +34,16 @@
   // Phrases that identify the throwaway error bubbles we hide. Kept specific so we
   // never hide a normal conversation message that merely mentions "rate limit".
   const HIDE_PATTERNS = /you've reached the rate limit|reached the rate limit|rate limit exceeded|please wait a bit before trying again|you have an unpaid invoice|unpaid invoice/i;
+  const RETRYABLE_PATTERNS = /you've reached the rate limit|reached the rate limit|rate limit exceeded|please wait a bit before trying again|you have an unpaid invoice|unpaid invoice|billing|payment required|usage limit|too many requests|http\s*402|status\s*402/i;
   // Nodes we hid directly (vs. via the stylesheet), so cleanup can restore them.
   // Capped at 50 to avoid unbounded array growth during long retry sessions.
   const HIDDEN_NODES_MAX = 50;
   const hiddenNodes = [];
+  const hiddenPopupNodes = [];
 
   let enabled = true;
   let mode = "IDLE"; // IDLE | HITTING | RETRYING | PAUSED
+  let activeRetryBubble = null;
   let hitCount = 0;
   let totalHits = 0;
   let retryCount = 0;
@@ -73,8 +76,24 @@
   const CH_SPAN = Number(CH.span) > 0 ? Number(CH.span) : 30;
   const CH_TOKEN = CH.token || "";
   const SESSION_RE = /当前会话\s*ID\s*[:：]\s*(agent-[A-Za-z0-9_-]+)/;
-  const SESSION_SCAN_MS = 800;
+  const SESSION_SCAN_MS = 3000;
+  const CONTROL_POLL_MS = 2500;
+  const CONTROL_SCAN_MIN_MS = 5000;
+  const CONTROL_SCAN_MAX_BACKOFF_MS = 30000;
+  const OWNER_PROBE_MIN_MS = 5000;
+  const OWNER_PROBE_MAX_BACKOFF_MS = 30000;
   let chPort = 0;              // cached owner port for the active session
+  let chPortAgentId = "";      // agent id that proved ownership on chPort
+  let controlPort = 0;
+  let controlNextPollAt = 0;
+  let controlNextScanAt = 0;
+  let controlScanBackoffMs = CONTROL_SCAN_MIN_MS;
+  let controlPollInFlight = false;
+  let ownerProbeAgentId = "";
+  let ownerProbeNextAt = 0;
+  let ownerProbeBackoffMs = OWNER_PROBE_MIN_MS;
+  let ownerProbePromise = null;
+  let activePushInFlight = false;
   let lastPushedSession = ""; // last agent id we synced to the panel
   let lastPushedTitle = "";
   let lastSessionScan = 0;
@@ -124,6 +143,36 @@
     return all.length ? all[all.length - 1] : null;
   }
 
+  function popupHuman(popup) {
+    if (!popup) return null;
+    return popup.closest('[data-message-role="human"]') || popup.closest(".composer-sticky-human-message");
+  }
+
+  function compactText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function retryablePopupText(popup) {
+    const human = popupHuman(popup);
+    return compactText(`${popup && popup.textContent ? popup.textContent : ""} ${human && human.textContent ? human.textContent : ""}`);
+  }
+
+  function isRetryablePopup(popup) {
+    if (!popup) return false;
+    const text = retryablePopupText(popup);
+    if (text && RETRYABLE_PATTERNS.test(text)) return true;
+    return Boolean(lastHitTime && Date.now() - lastHitTime < 8000);
+  }
+
+  function findRetryablePopup(root) {
+    const scope = root || document;
+    const popups = scope.querySelectorAll ? scope.querySelectorAll(".composer-warning-popup") : [];
+    for (let i = 0; i < popups.length; i += 1) {
+      if (isRetryablePopup(popups[i])) return popups[i];
+    }
+    return null;
+  }
+
   function waitFor(selector, { root, timeout = 5000 } = {}) {
     const scope = root || document.body;
     return new Promise((resolve) => {
@@ -170,14 +219,65 @@
     });
   }
 
+  function currentRetryablePopup() {
+    return (activeRetryBubble && document.body.contains(activeRetryBubble) ? findRetryablePopup(activeRetryBubble) : null) || findRetryablePopup();
+  }
+
+  function waitForRetryableGone(timeout = 5000) {
+    return new Promise((resolve) => {
+      if (!currentRetryablePopup()) { resolve(true); return; }
+      let done = false;
+      let observer = null;
+      let timer = null;
+      const finish = (gone) => {
+        if (done) return;
+        done = true;
+        if (observer) observer.disconnect();
+        clearTimeout(timer);
+        resolve(gone);
+      };
+      observer = new MutationObserver(() => {
+        if (!currentRetryablePopup()) finish(true);
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      timer = setTimeout(() => finish(false), timeout);
+    });
+  }
+
+  function waitForRetryableReappear(timeout = 3000) {
+    return new Promise((resolve) => {
+      const hit = currentRetryablePopup();
+      if (hit) { resolve(hit); return; }
+      let done = false;
+      let observer = null;
+      let timer = null;
+      const finish = (popup) => {
+        if (done) return;
+        done = true;
+        if (observer) observer.disconnect();
+        clearTimeout(timer);
+        resolve(popup);
+      };
+      observer = new MutationObserver(() => {
+        const popup = currentRetryablePopup();
+        if (popup) finish(popup);
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      timer = setTimeout(() => finish(null), timeout);
+    });
+  }
+
   async function retryOnce() {
-    const bubble = findFailureBubble();
+    const popup = (activeRetryBubble && document.body.contains(activeRetryBubble) ? findRetryablePopup(activeRetryBubble) : null) || findRetryablePopup();
+    const bubble = popupHuman(popup) || activeRetryBubble || findFailureBubble();
     if (!bubble) return false;
+    activeRetryBubble = bubble;
     (bubble.querySelector(".composer-human-message") || bubble).click();
 
     const sendButton = await new Promise((resolve) => {
       const find = () => {
-        const current = findFailureBubble();
+        const currentPopup = (activeRetryBubble && document.body.contains(activeRetryBubble) ? findRetryablePopup(activeRetryBubble) : null) || findRetryablePopup();
+        const current = popupHuman(currentPopup) || activeRetryBubble || findFailureBubble();
         return current ? current.querySelector(".send-with-mode .anysphere-icon-button") : null;
       };
       const immediate = find();
@@ -221,8 +321,9 @@
     return false;
   }
 
-  async function retryWave() {
+  async function retryWave(initialPopup) {
     if (!enabled || mode === "RETRYING") return;
+    activeRetryBubble = popupHuman(initialPopup) || null;
     mode = "RETRYING";
     retryCount = 0;
     // Reset the native (request-layer) circuit-breaker counter so the click below
@@ -235,7 +336,7 @@
     log("retry wave started");
 
     while (enabled && mode === "RETRYING" && retryCount < CFG.MAX_RETRIES) {
-      if (!q(".composer-warning-popup")) break;
+      if (!currentRetryablePopup()) break;
       retryCount += 1;
       totalRetries += 1;
       updateAllButtons();
@@ -246,26 +347,27 @@
         continue;
       }
 
-      const gone = await waitForGone(".composer-warning-popup", { timeout: CFG.WARNING_GONE_WAIT_MS });
+      const gone = await waitForRetryableGone(CFG.WARNING_GONE_WAIT_MS);
       if (!enabled || mode !== "RETRYING") return;
       if (!gone) {
         await sleep(retryGapMs(retryCount));
         continue;
       }
 
-      const reappeared = await waitFor(".composer-warning-popup", { timeout: CFG.SETTLE_MS });
+      const reappeared = await waitForRetryableReappear(CFG.SETTLE_MS);
       if (!reappeared) break;
       await sleep(retryGapMs(retryCount));
     }
 
     // Recovered = we did at least one retry and the failure warning is now gone.
-    const recovered = retryCount > 0 && !q(".composer-warning-popup");
+    const recovered = retryCount > 0 && !currentRetryablePopup();
     if (recovered) {
       lastRecoverRetries = retryCount;
       recoverCount += 1;
       successFlashUntil = Date.now() + SUCCESS_FLASH_MS;
     }
     mode = enabled ? "IDLE" : "PAUSED";
+    activeRetryBubble = null;
     updateAllButtons();
     // Clear the success flash after it expires.
     if (recovered) setTimeout(updateAllButtons, SUCCESS_FLASH_MS + 80);
@@ -279,15 +381,74 @@
   // so success detection is unaffected.
   function ensureHideStyle() {
     let el = document.getElementById("lca-hide-style");
-    if (!autoHide) {
-      if (el) el.remove();
-      return;
+    if (el) el.remove();
+  }
+
+  function hideRetryablePopups() {
+    document.querySelectorAll(".composer-warning-popup").forEach((popup) => {
+      if (!autoHide || !isRetryablePopup(popup)) {
+        if (popup.dataset && popup.dataset.lcaPopupHidden === "1") {
+          try {
+            popup.style.removeProperty("opacity");
+            popup.style.removeProperty("pointer-events");
+            popup.style.removeProperty("max-height");
+            popup.style.removeProperty("height");
+            popup.style.removeProperty("min-height");
+            popup.style.removeProperty("margin");
+            popup.style.removeProperty("padding");
+            popup.style.removeProperty("border");
+            popup.style.removeProperty("overflow");
+            delete popup.dataset.lcaPopupHidden;
+          } catch (e) {}
+        }
+        return;
+      }
+      if (popup.dataset && popup.dataset.lcaPopupHidden === "1") return;
+      if (popup.dataset) popup.dataset.lcaPopupHidden = "1";
+      popup.style.setProperty("opacity", "0", "important");
+      popup.style.setProperty("pointer-events", "none", "important");
+      popup.style.setProperty("max-height", "0", "important");
+      popup.style.setProperty("height", "0", "important");
+      popup.style.setProperty("min-height", "0", "important");
+      popup.style.setProperty("margin", "0", "important");
+      popup.style.setProperty("padding", "0", "important");
+      popup.style.setProperty("border", "0", "important");
+      popup.style.setProperty("overflow", "hidden", "important");
+      hiddenPopupNodes.push(popup);
+    });
+    while (hiddenPopupNodes.length > HIDDEN_NODES_MAX) {
+      const old = hiddenPopupNodes.shift();
+      try {
+        old.style.removeProperty("opacity");
+        old.style.removeProperty("pointer-events");
+        old.style.removeProperty("max-height");
+        old.style.removeProperty("height");
+        old.style.removeProperty("min-height");
+        old.style.removeProperty("margin");
+        old.style.removeProperty("padding");
+        old.style.removeProperty("border");
+        old.style.removeProperty("overflow");
+        if (old.dataset) delete old.dataset.lcaPopupHidden;
+      } catch (e) {}
     }
-    if (el) return;
-    el = document.createElement("style");
-    el.id = "lca-hide-style";
-    el.textContent = ".composer-warning-popup{opacity:0!important;pointer-events:none!important;max-height:0!important;height:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;}";
-    (document.head || document.documentElement).appendChild(el);
+  }
+
+  function restoreHiddenPopups() {
+    while (hiddenPopupNodes.length) {
+      const popup = hiddenPopupNodes.pop();
+      try {
+        popup.style.removeProperty("opacity");
+        popup.style.removeProperty("pointer-events");
+        popup.style.removeProperty("max-height");
+        popup.style.removeProperty("height");
+        popup.style.removeProperty("min-height");
+        popup.style.removeProperty("margin");
+        popup.style.removeProperty("padding");
+        popup.style.removeProperty("border");
+        popup.style.removeProperty("overflow");
+        if (popup.dataset) delete popup.dataset.lcaPopupHidden;
+      } catch (e) {}
+    }
   }
 
   // Hide the "Rate limit exceeded" / "unpaid invoice" error bubbles. These render
@@ -364,12 +525,15 @@
   }
 
   function doChecks() {
+    maybeSyncControl();
     injectButtons();
     maybeSessionScan();
     ensureHideStyle();
+    hideRetryablePopups();
     hideErrorBubbles();
-    if (enabled && mode !== "RETRYING" && q(".composer-warning-popup")) {
-      retryWave();
+    const retryablePopup = findRetryablePopup();
+    if (enabled && mode !== "RETRYING" && retryablePopup) {
+      retryWave(retryablePopup);
     }
   }
 
@@ -586,10 +750,72 @@
     return originalFetch(`http://127.0.0.1:${port}${pathname}`, options).finally(() => clearTimeout(timer));
   }
 
+  function applyControl(control) {
+    if (!control || typeof control !== "object") return;
+    const nextEnabled = control.enabled !== false;
+    const nextAutoHide = control.autoHide !== false;
+    if (enabled !== nextEnabled) {
+      enabled = nextEnabled;
+      mode = enabled ? "IDLE" : "PAUSED";
+    }
+    if (autoHide !== nextAutoHide) {
+      autoHide = nextAutoHide;
+      if (!autoHide) {
+        restoreHiddenPopups();
+        while (hiddenNodes.length) {
+          const node = hiddenNodes.pop();
+          try { node.style.removeProperty("display"); if (node.dataset) delete node.dataset.lcaHidden; } catch (e) {}
+        }
+      }
+    }
+    updateAllButtons();
+  }
+
+  async function readControlFromPort(port) {
+    const res = await chFetch(port, `/lca/control?token=${encodeURIComponent(CH_TOKEN)}`);
+    if (!res || !res.ok) return false;
+    const data = await res.json().catch(() => null);
+    if (!data || data.app !== "local-continue") return false;
+    controlPort = port;
+    controlScanBackoffMs = CONTROL_SCAN_MIN_MS;
+    controlNextScanAt = 0;
+    applyControl(data.control);
+    return true;
+  }
+
+  async function maybeSyncControl() {
+    if (!CH_TOKEN || controlPollInFlight) return;
+    const now = Date.now();
+    if (now < controlNextPollAt) return;
+    controlNextPollAt = now + CONTROL_POLL_MS;
+    controlPollInFlight = true;
+    try {
+      if (controlPort && await readControlFromPort(controlPort)) return;
+      if (chPort && await readControlFromPort(chPort)) return;
+      if (controlNextScanAt && now < controlNextScanAt) return;
+      for (let port = CH_BASE; port < CH_BASE + CH_SPAN; port += 1) {
+        if (port === controlPort || port === chPort) continue;
+        if (await readControlFromPort(port)) return;
+      }
+      controlPort = 0;
+      controlNextScanAt = Date.now() + controlScanBackoffMs;
+      controlScanBackoffMs = Math.min(CONTROL_SCAN_MAX_BACKOFF_MS, controlScanBackoffMs * 2);
+    } catch (e) {
+      controlPort = 0;
+    } finally {
+      controlPollInFlight = false;
+    }
+  }
+
   // Find the channel port whose window owns this session. Each Cursor window
   // binds its own port in [base, base+span); we probe the range and pick the one
   // that reports ownership, caching it for next time.
   async function findOwnerPort(agentId) {
+    if (chPort && chPortAgentId === agentId) return chPort;
+    const now = Date.now();
+    if (ownerProbePromise && ownerProbeAgentId === agentId) return ownerProbePromise;
+    if (ownerProbeAgentId === agentId && ownerProbeNextAt && now < ownerProbeNextAt) return 0;
+
     const owns = async (port) => {
       try {
         const res = await chFetch(port, `/lca/ping?session=${encodeURIComponent(agentId)}`);
@@ -598,13 +824,35 @@
         return Boolean(data && data.app === "local-continue" && data.owns);
       } catch (e) { return false; }
     };
-    if (chPort && await owns(chPort)) return chPort;
-    for (let port = CH_BASE; port < CH_BASE + CH_SPAN; port++) {
-      if (port === chPort) continue;
-      if (await owns(port)) { chPort = port; return port; }
+    ownerProbeAgentId = agentId;
+    ownerProbePromise = (async () => {
+      if (chPort && await owns(chPort)) {
+        chPortAgentId = agentId;
+        ownerProbeNextAt = 0;
+        ownerProbeBackoffMs = OWNER_PROBE_MIN_MS;
+        return chPort;
+      }
+      for (let port = CH_BASE; port < CH_BASE + CH_SPAN; port++) {
+        if (port === chPort) continue;
+        if (await owns(port)) {
+          chPort = port;
+          chPortAgentId = agentId;
+          ownerProbeNextAt = 0;
+          ownerProbeBackoffMs = OWNER_PROBE_MIN_MS;
+          return port;
+        }
+      }
+      chPort = 0;
+      chPortAgentId = "";
+      ownerProbeNextAt = Date.now() + ownerProbeBackoffMs;
+      ownerProbeBackoffMs = Math.min(OWNER_PROBE_MAX_BACKOFF_MS, ownerProbeBackoffMs * 2);
+      return 0;
+    })();
+    try {
+      return await ownerProbePromise;
+    } finally {
+      ownerProbePromise = null;
     }
-    chPort = 0;
-    return 0;
   }
 
   // ② Tell the panel which session the active conversation belongs to, so it
@@ -626,6 +874,41 @@
         if (data && data.matched) { lastPushedSession = agentId; lastPushedTitle = cleanTitle; log("synced active session", agentId, cleanTitle); }
       }
     } catch (e) { /* best effort */ }
+  }
+
+  async function pushActiveSessionQuietly(agentId, title) {
+    const cleanTitle = cleanPaneTitle(title);
+    if (!agentId || (agentId === lastPushedSession && cleanTitle === lastPushedTitle)) return;
+    if (activePushInFlight) return;
+    activePushInFlight = true;
+    try {
+      const port = await findOwnerPort(agentId);
+      if (!port) return;
+      const res = await chFetch(port, "/lca/active", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId, title: cleanTitle, token: CH_TOKEN }),
+      });
+      if (!res || !res.ok) {
+        chPort = 0;
+        chPortAgentId = "";
+        return;
+      }
+      const data = await res.json().catch(() => null);
+      if (data && data.matched) {
+        lastPushedSession = agentId;
+        lastPushedTitle = cleanTitle;
+        log("synced active session", agentId, cleanTitle);
+      } else {
+        chPort = 0;
+        chPortAgentId = "";
+      }
+    } catch (e) {
+      chPort = 0;
+      chPortAgentId = "";
+    } finally {
+      activePushInFlight = false;
+    }
   }
 
   function sessionScopeFor(area) {
@@ -717,7 +1000,7 @@
       e.preventDefault();
       e.stopPropagation();
       const id = chip.dataset.agentId || "";
-      if (id) { lastPushedSession = ""; pushActiveSession(id, chip.dataset.title || ""); }
+      if (id) { lastPushedSession = ""; pushActiveSessionQuietly(id, chip.dataset.title || ""); }
     };
     const retry = area.querySelector(".lca-retry-btn");
     if (retry) area.insertBefore(chip, retry); else area.appendChild(chip);
@@ -763,7 +1046,7 @@
     lastSessionScan = now;
     let active = null;
     try { active = updateSessionChips(); } catch (e) { /* DOM shape changed */ }
-    if (active && active.agentId) pushActiveSession(active.agentId, active.title || "");
+    if (active && active.agentId) pushActiveSessionQuietly(active.agentId, active.title || "");
   }
 
   function bootstrap() {
@@ -792,6 +1075,7 @@
     lastRecoverRetries,
     maxRetries: CFG.MAX_RETRIES,
     autoHide,
+    controlPort,
     hidden: hiddenNodes.length,
     lastHitTime: lastHitTime ? new Date(lastHitTime).toLocaleString() : "",
   });
@@ -802,6 +1086,7 @@
       hideErrorBubbles();
     } else {
       // Restore everything we hid directly so the user can see past errors again.
+      restoreHiddenPopups();
       while (hiddenNodes.length) {
         const node = hiddenNodes.pop();
         try { node.style.removeProperty("display"); if (node.dataset) delete node.dataset.lcaHidden; } catch (e) {}
@@ -825,6 +1110,7 @@
     document.querySelectorAll(".lca-sess").forEach((element) => element.remove());
     const hideStyle = document.getElementById("lca-hide-style");
     if (hideStyle) hideStyle.remove();
+    restoreHiddenPopups();
     while (hiddenNodes.length) {
       const node = hiddenNodes.pop();
       try { node.style.removeProperty("display"); if (node.dataset) delete node.dataset.lcaHidden; } catch (e) {}

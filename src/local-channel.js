@@ -51,10 +51,18 @@ class LocalChannel {
     this.onActive = onActive || (() => {});
     this.server = null;
     this.port = 0;
+    this.control = { enabled: true, autoHide: true, updatedAt: Date.now() };
   }
 
   isListening() { return Boolean(this.server && this.server.listening); }
   getPort() { return this.port; }
+  getControl() { return { ...this.control }; }
+  setControl(next) {
+    if (next && Object.prototype.hasOwnProperty.call(next, "enabled")) this.control.enabled = next.enabled !== false;
+    if (next && Object.prototype.hasOwnProperty.call(next, "autoHide")) this.control.autoHide = next.autoHide !== false;
+    this.control.updatedAt = Date.now();
+    return this.getControl();
+  }
 
   // Bind the first free port in [BASE, BASE+SPAN). Each Cursor window gets its
   // own port; the injected helper probes the range and routes by ownership, so
@@ -105,6 +113,22 @@ class LocalChannel {
     if (req.method === "GET" && url.pathname === "/lca/ping") {
       const sess = url.searchParams.get("session") || "";
       this._send(res, 200, { ok: true, app: "local-continue", owns: sess ? this._owns(sess) : false });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/lca/control") {
+      if (!this.token || url.searchParams.get("token") !== this.token) { this._send(res, 403, { error: "forbidden" }); return; }
+      this._send(res, 200, { ok: true, app: "local-continue", control: this.getControl() });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/lca/control") {
+      let body = "";
+      req.on("data", (c) => { body += c; if (body.length > 65536) req.destroy(); });
+      req.on("end", () => {
+        let data = null;
+        try { data = JSON.parse(body || "{}"); } catch { this._send(res, 400, { error: "bad json" }); return; }
+        if (!this.token || data.token !== this.token) { this._send(res, 403, { error: "forbidden" }); return; }
+        this._send(res, 200, { ok: true, control: this.setControl(data.control || data) });
+      });
       return;
     }
     if (req.method === "POST" && url.pathname === "/lca/active") {

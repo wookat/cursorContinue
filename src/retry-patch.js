@@ -48,6 +48,27 @@ function workbenchPath() {
 
 const RETRY_PATCH_CACHE_MS = 300000;
 
+function detectExternalPatches(target) {
+  const conflicts = [];
+  if (!target) return conflicts;
+  const appRoot = path.resolve(path.dirname(target), "..", "..", "..");
+  const workbenchHtml = path.join(appRoot, "out", "vs", "code", "electron-sandbox", "workbench", "workbench.html");
+  const cthHook = path.join(appRoot, "out", "vs", "code", "electron-sandbox", "workbench", "cth-autochat-hook.js");
+  try {
+    const html = fs.existsSync(workbenchHtml) ? fs.readFileSync(workbenchHtml, "utf8") : "";
+    if (html.includes("CTH_AUTOCHAT_HOOK_BEGIN") || html.includes("cth-autochat-hook.js") || fs.existsSync(cthHook)) {
+      conflicts.push({
+        id: "cth-autochat",
+        name: "CTH AutoChat",
+        detail: "Detected CTH AutoChat workbench hook; it may also retry official chat failures.",
+      });
+    }
+  } catch {
+    // Best effort only. A failed conflict scan should never block patch status.
+  }
+  return conflicts;
+}
+
 function getRetryPatchStatus({ force = false } = {}) {
   if (vscode.env.remoteName) return { found: false, installed: false, target: "", remote: true, note: "此功能只作用于本机 Cursor，不作用于远程服务器。" };
   if (!force && retryPatchCache.value && nowMs() - retryPatchCache.at < RETRY_PATCH_CACHE_MS) return retryPatchCache.value;
@@ -57,9 +78,9 @@ function getRetryPatchStatus({ force = false } = {}) {
   else {
     try {
       const tail = readFileTail(target, 524288);
-      value = { found: true, installed: tail.includes(PATCH_START), target };
+      value = { found: true, installed: tail.includes(PATCH_START), target, conflicts: detectExternalPatches(target) };
     } catch (error) {
-      value = { found: true, installed: false, target, error: error.message };
+      value = { found: true, installed: false, target, error: error.message, conflicts: detectExternalPatches(target) };
     }
   }
   retryPatchCache = { at: nowMs(), value };

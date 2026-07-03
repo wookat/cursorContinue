@@ -2,7 +2,7 @@
   "name": "local-continue-assistant",
   "displayName": "续聊助手",
   "description": "Cursor 续聊助手：队列、握手、状态反馈、附件输入、图片粘贴和官方聊天框重试助手。",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "publisher": "local-codex",
   "license": "MIT",
   "icon": "media/extension-icon.png",
@@ -86,7 +86,7 @@
     ]
   },
   "scripts": {
-    "package": "vsce package --no-dependencies --allow-missing-repository --out dist/"
+    "package": "vsce package --no-dependencies --allow-missing-repository --no-rewrite-relative-links --out dist/"
   },
   "devDependencies": {
     "@vscode/vsce": "^3.6.2"
@@ -96,6 +96,7 @@
     "package.json",
     "README.md",
     "LICENSE",
+    "CHANGELOG.md",
     "media/extension-icon.png",
     "media/icon.svg",
     "media/panel.css",

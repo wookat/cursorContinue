@@ -570,6 +570,12 @@ class PanelProvider {
       this.event(`已注入图标 / 安装重试助手${np}${elev}${cleaned}，需完全退出并重启 Cursor（不是重载窗口）才会生效：${result.target}`);
       this.postStatus({ forcePatch: true });
       return true;
+    } else if (message.type === "setRetryHelperEnabled") {
+      this.ensureChannel();
+      if (this.channel) this.channel.setControl({ enabled: message.enabled !== false });
+      this.event(message.enabled === false ? "已暂停官方聊天框自动重试。" : "已启用官方聊天框自动重试。");
+      this.postStatus({ forcePatch: false });
+      return true;
     } else if (message.type === "uninstallRetryPatch") {
       const result = uninstallRetryPatch(this.context);
       this.event(result.changed ? `已卸载本机聊天框重试助手，重启 Cursor 生效：${result.target}` : "重试助手未安装。");
@@ -585,6 +591,7 @@ class PanelProvider {
   postStatus(options = {}) {
     if (this.clients.size === 0) return;
     const status = getBridgeStatus(this.context, options);
+    status.retryControl = this.channel ? this.channel.getControl() : null;
     this.reply({ type: "status", status });
     this.notifyAttention(status);
     this.scheduleNext(status);
